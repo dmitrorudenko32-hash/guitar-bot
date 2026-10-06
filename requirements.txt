@@ -2,3 +2,4 @@ aiogram
 aiohttp
 python-dotenv
 beautifulsoup4
+psycopg[binary]

@@ -766,7 +766,8 @@ def song_card(song, semitones=None):
 
     star = "⭐" if favorite else "☆"
     shown_key = transpose_key(song_key, semitones) if song_key else "не вказана"
-    shown_lyrics = transpose_text(lyrics, semitones)
+    # v4.2: оформлення секцій + акордів застосовується саме тут.
+    shown_lyrics = pretty_song_lyrics(lyrics, semitones)
 
     transpose_label = "Оригінал" if semitones == 0 else f"{semitones:+d}"
 
@@ -779,13 +780,10 @@ def song_card(song, semitones=None):
         f"{star} {'Улюблена' if favorite else 'Не в улюблених'}"
     )
 
-    # Telegram має ліміт довжини повідомлення. Для картки залишаємо запас.
-    body = escape_html(shown_lyrics)
-    max_body = 3300
-    if len(body) > max_body:
-        body = body[:max_body] + "\n\n…текст скорочено"
-
-    text = header + "\n\n<pre>" + body + "</pre>"
+    # shown_lyrics already contains safe Telegram HTML.
+    # Не загортаємо всю пісню в <pre>, інакше <b>/<code> не працюватимуть.
+    body = trim_html_message(shown_lyrics, 3300)
+    text = header + "\n\n" + body
 
     keyboard_rows = [
         [

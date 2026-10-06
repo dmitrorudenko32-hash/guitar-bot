@@ -410,85 +410,120 @@ async def import_from_diez(url):
 
     title = " ".join(h1.get_text(" ", strip=True).split())
 
-    # У Diez виконавець зазвичай стоїть безпосередньо перед H1.
+    # Diez: найнадійніше дістаємо виконавця з <title> сторінки:
+    # "Обійми — Океан Ельзи: акорди, текст, тональність | Diez"
     artist = ""
-    prev = h1.find_previous()
-    checked = 0
-    while prev and checked < 15:
-        txt = " ".join(prev.get_text(" ", strip=True).split())
-        if txt and txt != title and len(txt) <= 100:
-            # Відсікаємо типові елементи інтерфейсу.
-            low = txt.lower()
-            if not any(x in low for x in (
-                "акорди", "текст пісні", "транспон", "увійти",
-                "реєстра", "головна", "пісні"
-            )):
-                artist = txt
-                break
-        prev = prev.find_previous()
-        checked += 1
+    page_title = soup.title.get_text(" ", strip=True) if soup.title else ""
+    m = re.match(r"(.+?)\s+[—–-]\s+(.+?)(?::\s*акорди|[|])", page_title, re.I)
+    if m:
+        title = m.group(1).strip()
+        artist = m.group(2).strip()
 
     if not artist:
-        # Часто title сторінки має формат "Назва — Виконавець: ..."
-        page_title = soup.title.get_text(" ", strip=True) if soup.title else ""
-        m = re.match(r"(.+?)\s+[—–-]\s+(.+?)(?::| \|)", page_title)
-        if m:
-            title = m.group(1).strip()
-            artist = m.group(2).strip()
+        # запасний варіант: посилання на виконавця перед H1
+        link = h1.find_previous("a")
+        if link:
+            candidate = " ".join(link.get_text(" ", strip=True).split())
+            if candidate and len(candidate) <= 100:
+                artist = candidate
 
     if not artist:
         artist = "Невідомий виконавець"
 
-    # Вибираємо контейнер, у якому є H1 і найбільше акордів.
-    candidates = []
-    node = h1
-    for _ in range(8):
-        node = node.parent
-        if not node:
+    # Перетворюємо HTML на рядки. На Diez сама пісня починається
+    # з "Вступ"/"Куплет"/"Приспів", а після неї йде фраза
+    # "... можна грати на гітарі ...".
+    raw = soup.get_text("\n", strip=True)
+    lines = [x.strip() for x in raw.splitlines() if x.strip()]
+
+    section_re = re.compile(
+        r"^(Вступ|Куплет(?:\s*\d+)?|Приспів(?:\s*\d+)?|"
+        r"Брідж|Міст|Кода|Програш|Передприспів|Постприспів)\s*:?\s*$",
+        re.I
+    )
+
+    first = None
+    for i, line in enumerate(lines):
+        if section_re.match(line):
+            first = i
             break
-        txt = node.get_text("\n", strip=True)
-        chord_count = len(CHORD_RE.findall(txt))
-        if 80 <= len(txt) <= 25000 and chord_count >= 2:
-            score = chord_count * 50 - len(txt) / 100
-            if re.search(r"(?i)\b(Вступ|Куплет|Приспів|Кода)\b", txt):
-                score += 500
-            candidates.append((score, txt))
 
-    if not candidates:
-        raise ValueError("Не вдалося знайти текст з акордами на Diez.")
+    if first is None:
+        raise ValueError("Не вдалося знайти початок пісні на Diez.")
 
-    candidates.sort(key=lambda x: x[0], reverse=True)
-    lyrics = clean_song_text(candidates[0][1])
+    song_lines = []
+    for line in lines[first:]:
+        low = line.lower()
 
-    # Прибираємо заголовок/виконавця з початку контейнера.
-    lines = lyrics.splitlines()
-    while lines and lines[0].strip() in {artist, title}:
-        lines.pop(0)
-    lyrics = "\n".join(lines).strip()
+        # Кінець основного блоку пісні.
+        if (
+            "можна грати на гітарі" in low
+            or line == "Поскаржитись"
+            or line == "Українські пісні, тексти й акорди для гри та співу."
+        ):
+            break
 
-    # Обрізаємо SEO-пояснення після пісні.
-    for phrase in (
-        "Це повний текст пісні",
-        "Схожі пісні",
-        "Інші пісні",
-        "Коментарі",
-    ):
-        pos = lyrics.find(phrase)
-        if pos >= 80:
-            lyrics = lyrics[:pos].strip()
+        # Службові елементи Diez, якщо раптом трапляться всередині.
+        if line in {
+            "Режим для новачка",
+            "Тональність і аплікатури без баре",
+            "Транспонування",
+            "Гітара",
+            "Укулеле",
+            "Клавіші",
+            "Інструменти",
+            "Тюнер",
+            "Без баре",
+            "Розмір тексту",
+        }:
+            continue
 
-    if len(lyrics) < 80:
+        if re.fullmatch(r"\[?Button:.*\]?", line, re.I):
+            continue
+        if re.fullmatch(r"[‹›<>]", line):
+            continue
+
+        song_lines.append(line)
+
+    lyrics = clean_song_text("\n".join(song_lines))
+
+    if len(lyrics) < 80 or len(CHORD_RE.findall(lyrics)) < 2:
         raise ValueError("Знайдений текст Diez виглядає неповним.")
+
+    # Не вважаємо перший акорд тональністю. На Diez він може бути
+    # домінантним/вступним (наприклад G7), тому шукаємо найчастіший
+    # кореневий акорд у пісні.
+    roots = []
+    for chord in CHORD_RE.findall(lyrics):
+        if isinstance(chord, tuple):
+            chord = chord[0]
+        token = str(chord)
+        mm = re.match(r"^([A-G](?:#|b)?)", token)
+        if mm:
+            roots.append(mm.group(1))
+
+    song_key = detect_key_from_text(lyrics)
+    if roots:
+        from collections import Counter
+        root = Counter(roots).most_common(1)[0][0]
+
+        # Визначаємо major/minor за найчастішими акордами цього кореня.
+        minor_count = len(re.findall(
+            rf"(?<![A-G#b]){re.escape(root)}m(?:\b|(?=[0-9/]))", lyrics
+        ))
+        major_count = len(re.findall(
+            rf"(?<![A-G#b]){re.escape(root)}(?![#bm])(?:\d+)?(?:\b|/)", lyrics
+        ))
+        song_key = root + ("m" if minor_count > major_count else "")
 
     return {
         "title": title,
         "artist": artist,
-        "song_key": detect_key_from_text(lyrics),
+        "song_key": song_key,
         "lyrics": lyrics,
         "source_url": url.strip(),
         "source": "Diez",
     }
-
 
 async def import_from_telegram(url):
     parsed = urlparse(url.strip())

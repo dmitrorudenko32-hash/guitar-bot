@@ -1,7 +1,10 @@
 import os
 import sqlite3
 import random
-from aiohttp import web
+import re
+from urllib.parse import urlparse
+from aiohttp import web, ClientSession, ClientTimeout
+from bs4 import BeautifulSoup
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart, Command
@@ -79,6 +82,16 @@ CREATE TABLE IF NOT EXISTS songs (
 )
 """)
 
+# Додаємо нові поля без втрати вже збережених пісень
+cursor.execute("PRAGMA table_info(songs)")
+existing_columns = {row[1] for row in cursor.fetchall()}
+
+if "source_url" not in existing_columns:
+    cursor.execute("ALTER TABLE songs ADD COLUMN source_url TEXT")
+
+if "capo" not in existing_columns:
+    cursor.execute("ALTER TABLE songs ADD COLUMN capo INTEGER NOT NULL DEFAULT 0")
+
 db.commit()
 
 
@@ -88,6 +101,7 @@ db.commit()
 
 ADD_STATE = {}
 SEARCH_WAITING = set()
+TRANSPOSE_STATE = {}
 
 
 # ==================================================
@@ -199,63 +213,258 @@ def bottom_keyboard():
 
 def get_song(song_id):
     cursor.execute("""
-        SELECT id, title, artist, song_key, lyrics, favorite
+        SELECT id, title, artist, song_key, lyrics, favorite,
+               COALESCE(source_url, ''), COALESCE(capo, 0)
         FROM songs
         WHERE id = ?
     """, (song_id,))
     return cursor.fetchone()
 
 
-def song_card(song):
-    song_id, title, artist, song_key, lyrics, favorite = song
+CHROMATIC_SHARPS = ["C", "C#", "D", "D#", "E", "F",
+                    "F#", "G", "G#", "A", "A#", "B"]
 
-    star = "⭐" if favorite else "☆"
-    key_text = song_key if song_key else "не вказана"
+NOTE_TO_INDEX = {
+    "C": 0, "B#": 0,
+    "C#": 1, "Db": 1,
+    "D": 2,
+    "D#": 3, "Eb": 3,
+    "E": 4, "Fb": 4,
+    "F": 5, "E#": 5,
+    "F#": 6, "Gb": 6,
+    "G": 7,
+    "G#": 8, "Ab": 8,
+    "A": 9,
+    "A#": 10, "Bb": 10,
+    "B": 11, "Cb": 11,
+}
 
-    text = (
-        f"🎵 <b>{title}</b>\n"
-        f"👤 {artist}\n"
-        f"🎸 Тональність: <b>{key_text}</b>\n"
-        f"{star} {'Улюблена' if favorite else 'Не в улюблених'}\n\n"
-        f"<pre>{escape_html(lyrics)}</pre>"
-    )
+CHORD_RE = re.compile(
+    r"(?<![A-Za-zА-Яа-яІіЇїЄєҐґ])"
+    r"([A-G])([#b]?)(m|maj|min|dim|aug|sus)?"
+    r"(\d{0,2})?([+#-]?\d*)?"
+    r"(?:/([A-G])([#b]?))?"
+    r"(?![A-Za-zА-Яа-яІіЇїЄєҐґ])"
+)
 
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="⭐ Прибрати" if favorite else "⭐ В улюблені",
-                    callback_data=f"favorite_{song_id}"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🗑 Видалити",
-                    callback_data=f"delete_request_{song_id}"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🎵 До пісень",
-                    callback_data="songs"
-                ),
-                InlineKeyboardButton(
-                    text="🏠 Головна",
-                    callback_data="home"
-                ),
-            ],
-        ]
-    )
 
-    return text, keyboard
+def transpose_note(note, accidental, semitones):
+    raw = note + (accidental or "")
+    if raw not in NOTE_TO_INDEX:
+        return raw
+    return CHROMATIC_SHARPS[(NOTE_TO_INDEX[raw] + semitones) % 12]
+
+
+def transpose_chord_match(match, semitones):
+    root, accidental, quality, number, extension, bass, bass_acc = match.groups()
+    result = transpose_note(root, accidental, semitones)
+    result += quality or ""
+    result += number or ""
+    result += extension or ""
+    if bass:
+        result += "/" + transpose_note(bass, bass_acc, semitones)
+    return result
+
+
+def transpose_text(text, semitones):
+    if semitones == 0:
+        return text
+    return CHORD_RE.sub(lambda m: transpose_chord_match(m, semitones), text)
+
+
+def transpose_key(song_key, semitones):
+    if not song_key:
+        return ""
+    return transpose_text(song_key, semitones)
 
 
 def escape_html(text):
     return (
-        text.replace("&", "&amp;")
-            .replace("<", "&lt;")
-            .replace(">", "&gt;")
+        str(text).replace("&", "&amp;")
+                 .replace("<", "&lt;")
+                 .replace(">", "&gt;")
     )
+
+
+def clean_song_text(text):
+    text = text.replace("\r", "")
+    lines = [line.rstrip() for line in text.split("\n")]
+    cleaned = []
+    blank = False
+
+    for line in lines:
+        line = re.sub(r"[ \t]+", " ", line).strip()
+        if not line:
+            if cleaned and not blank:
+                cleaned.append("")
+            blank = True
+            continue
+        cleaned.append(line)
+        blank = False
+
+    return "\n".join(cleaned).strip()
+
+
+def detect_key_from_text(text):
+    # Для імпорту беремо перший знайдений акорд як орієнтовну тональність.
+    match = CHORD_RE.search(text or "")
+    return match.group(0) if match else ""
+
+
+async def import_from_mychords(url):
+    parsed = urlparse(url.strip())
+    host = parsed.netloc.lower().split(":")[0]
+
+    if host not in {"mychords.net", "www.mychords.net"}:
+        raise ValueError("Поки підтримується імпорт тільки з mychords.net")
+
+    timeout = ClientTimeout(total=20)
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; GuitarBot/2.0)"
+    }
+
+    async with ClientSession(timeout=timeout, headers=headers) as session:
+        async with session.get(url) as response:
+            if response.status != 200:
+                raise ValueError(f"MyChords повернув помилку HTTP {response.status}")
+            html = await response.text()
+
+    soup = BeautifulSoup(html, "html.parser")
+
+    h1 = soup.find("h1")
+    if not h1:
+        raise ValueError("Не вдалося знайти назву пісні на сторінці.")
+
+    heading = " ".join(h1.get_text(" ", strip=True).split())
+    if " - " in heading:
+        artist, title = heading.split(" - ", 1)
+    else:
+        artist, title = "Невідомий виконавець", heading
+
+    # MyChords змінював верстку кілька разів, тому шукаємо блок
+    # не за одним жорстким класом, а за кількома ознаками.
+    candidates = []
+    selectors = [
+        "[class*='song-text']", "[class*='song_text']",
+        "[class*='lyrics']", "[class*='chord']",
+        "[id*='song-text']", "[id*='song_text']",
+        "[id*='lyrics']", "[id*='chord']",
+        "pre"
+    ]
+
+    seen = set()
+    for selector in selectors:
+        for tag in soup.select(selector):
+            ident = id(tag)
+            if ident in seen:
+                continue
+            seen.add(ident)
+            txt = tag.get_text("\n", strip=False)
+            if len(txt) >= 120:
+                chord_count = len(CHORD_RE.findall(txt))
+                score = chord_count * 20 + min(len(txt), 10000) / 100
+                if "Приспів" in txt or "Припев" in txt:
+                    score += 100
+                if "Вступ" in txt or "Вступление" in txt:
+                    score += 100
+                candidates.append((score, txt))
+
+    # Запасний варіант: шукаємо найбільш схожий великий контейнер.
+    if not candidates:
+        for tag in soup.find_all(["div", "article", "section"]):
+            txt = tag.get_text("\n", strip=False)
+            if 150 <= len(txt) <= 20000:
+                chord_count = len(CHORD_RE.findall(txt))
+                if chord_count >= 4:
+                    score = chord_count * 20 + min(len(txt), 10000) / 100
+                    if "Приспів" in txt:
+                        score += 100
+                    candidates.append((score, txt))
+
+    if not candidates:
+        raise ValueError(
+            "Не вдалося автоматично знайти текст з акордами. "
+            "Можливо, MyChords змінив верстку."
+        )
+
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    lyrics = clean_song_text(candidates[0][1])
+
+    # Відсікаємо очевидний службовий хвіст, якщо він потрапив у контейнер.
+    stop_phrases = [
+        "Все ще шукаєш правильні акорди?",
+        "Редагувати\nПовідомити про помилку",
+        "Повідомити про помилку",
+        "Останні коментарі",
+    ]
+    for phrase in stop_phrases:
+        pos = lyrics.find(phrase)
+        if pos > 100:
+            lyrics = lyrics[:pos].strip()
+
+    if len(lyrics) < 80:
+        raise ValueError("Знайдений текст виглядає неповним.")
+
+    return {
+        "title": title.strip(),
+        "artist": artist.strip(),
+        "song_key": detect_key_from_text(lyrics),
+        "lyrics": lyrics,
+        "source_url": url.strip(),
+    }
+
+
+def song_card(song, semitones=0):
+    song_id, title, artist, song_key, lyrics, favorite, source_url, capo = song
+
+    star = "⭐" if favorite else "☆"
+    shown_key = transpose_key(song_key, semitones) if song_key else "не вказана"
+    shown_lyrics = transpose_text(lyrics, semitones)
+
+    transpose_label = "Оригінал" if semitones == 0 else f"{semitones:+d}"
+
+    header = (
+        f"🎵 <b>{escape_html(title)}</b>\n"
+        f"👤 {escape_html(artist)}\n"
+        f"🎸 Тональність: <b>{escape_html(shown_key)}</b>\n"
+        f"🎼 Транспонування: <b>{transpose_label}</b>\n"
+        f"📎 Капо: <b>{capo}</b>\n"
+        f"{star} {'Улюблена' if favorite else 'Не в улюблених'}"
+    )
+
+    # Telegram має ліміт довжини повідомлення. Для картки залишаємо запас.
+    body = escape_html(shown_lyrics)
+    max_body = 3300
+    if len(body) > max_body:
+        body = body[:max_body] + "\n\n…текст скорочено"
+
+    text = header + "\n\n<pre>" + body + "</pre>"
+
+    keyboard_rows = [
+        [
+            InlineKeyboardButton(text="⬇️ −1", callback_data=f"tr_-_{song_id}"),
+            InlineKeyboardButton(text=f"🎵 {transpose_label}", callback_data=f"tr_0_{song_id}"),
+            InlineKeyboardButton(text="⬆️ +1", callback_data=f"tr_+_{song_id}"),
+        ],
+        [
+            InlineKeyboardButton(
+                text="⭐ Прибрати" if favorite else "⭐ В улюблені",
+                callback_data=f"favorite_{song_id}"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="🗑 Видалити",
+                callback_data=f"delete_request_{song_id}"
+            )
+        ],
+        [
+            InlineKeyboardButton(text="🎵 До пісень", callback_data="songs"),
+            InlineKeyboardButton(text="🏠 Головна", callback_data="home"),
+        ],
+    ]
+
+    return text, InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
 
 
 def songs_view(only_favorites=False):
@@ -415,7 +624,47 @@ async def open_song(callback: CallbackQuery):
         )
         return
 
-    text, keyboard = song_card(song)
+    TRANSPOSE_STATE[song_id] = 0
+    text, keyboard = song_card(song, 0)
+    await edit_screen(callback, text, keyboard)
+
+
+# ==================================================
+# ТРАНСПОНУВАННЯ
+# ==================================================
+
+@dp.callback_query(F.data.startswith("tr_"))
+async def transpose_song(callback: CallbackQuery):
+    parts = callback.data.split("_")
+    if len(parts) != 3:
+        await safe_answer(callback)
+        return
+
+    action, song_id_text = parts[1], parts[2]
+    song_id = int(song_id_text)
+    song = get_song(song_id)
+
+    if not song:
+        await callback.answer("Пісню вже видалено.", show_alert=True)
+        return
+
+    current = TRANSPOSE_STATE.get(song_id, 0)
+
+    if action == "+":
+        current += 1
+    elif action == "-":
+        current -= 1
+    else:
+        current = 0
+
+    # Тримаємо значення у зрозумілому діапазоні.
+    if current > 11:
+        current = 0
+    if current < -11:
+        current = 0
+
+    TRANSPOSE_STATE[song_id] = current
+    text, keyboard = song_card(song, current)
     await edit_screen(callback, text, keyboard)
 
 
@@ -424,15 +673,23 @@ async def open_song(callback: CallbackQuery):
 # ==================================================
 
 async def begin_add_song(user_id, send_func):
-    ADD_STATE[user_id] = {
-        "step": "title",
-        "data": {}
-    }
-
+    ADD_STATE.pop(user_id, None)
     SEARCH_WAITING.discard(user_id)
 
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🔗 За посиланням MyChords",
+                    callback_data="add_by_url"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="📝 Вручну",
+                    callback_data="add_manual"
+                )
+            ],
             [
                 InlineKeyboardButton(
                     text="❌ Скасувати",
@@ -443,8 +700,8 @@ async def begin_add_song(user_id, send_func):
     )
 
     await send_func(
-        "➕ <b>Додаємо нову пісню</b>\n\n"
-        "1/4. Напиши <b>назву пісні</b>:",
+        "➕ <b>Додати пісню</b>\n\n"
+        "Як хочеш додати пісню?",
         parse_mode="HTML",
         reply_markup=keyboard
     )
@@ -461,6 +718,83 @@ async def bottom_add(message: Message):
     await begin_add_song(message.from_user.id, message.answer)
 
 
+@dp.callback_query(F.data == "add_by_url")
+async def add_by_url(callback: CallbackQuery):
+    ADD_STATE[callback.from_user.id] = {
+        "step": "url",
+        "data": {}
+    }
+
+    await edit_screen(
+        callback,
+        "🔗 <b>Імпорт з MyChords</b>\n\n"
+        "Надішли мені посилання на пісню з <b>mychords.net</b>.\n\n"
+        "Наприклад:\n"
+        "<code>https://mychords.net/uk/...</code>",
+        InlineKeyboardMarkup(
+            inline_keyboard=[[
+                InlineKeyboardButton(text="❌ Скасувати", callback_data="cancel_add")
+            ]]
+        )
+    )
+
+
+@dp.callback_query(F.data == "add_manual")
+async def add_manual(callback: CallbackQuery):
+    ADD_STATE[callback.from_user.id] = {
+        "step": "title",
+        "data": {}
+    }
+
+    await edit_screen(
+        callback,
+        "📝 <b>Додавання вручну</b>\n\n"
+        "1/4. Напиши <b>назву пісні</b>:",
+        InlineKeyboardMarkup(
+            inline_keyboard=[[
+                InlineKeyboardButton(text="❌ Скасувати", callback_data="cancel_add")
+            ]]
+        )
+    )
+
+
+@dp.callback_query(F.data == "save_import")
+async def save_import(callback: CallbackQuery):
+    state = ADD_STATE.get(callback.from_user.id)
+
+    if not state or state.get("step") != "confirm_import":
+        await callback.answer("Імпорт уже завершено або скасовано.", show_alert=True)
+        return
+
+    data = state["data"]
+
+    cursor.execute("""
+        INSERT INTO songs
+        (title, artist, song_key, lyrics, source_url)
+        VALUES (?, ?, ?, ?, ?)
+    """, (
+        data["title"],
+        data["artist"],
+        data.get("song_key", ""),
+        data["lyrics"],
+        data.get("source_url", "")
+    ))
+
+    song_id = cursor.lastrowid
+    db.commit()
+    ADD_STATE.pop(callback.from_user.id, None)
+
+    await callback.answer("✅ Пісню збережено")
+    song = get_song(song_id)
+    text, keyboard = song_card(song, 0)
+
+    await callback.message.edit_text(
+        text,
+        parse_mode="HTML",
+        reply_markup=keyboard
+    )
+
+
 @dp.callback_query(F.data == "cancel_add")
 async def cancel_add(callback: CallbackQuery):
     ADD_STATE.pop(callback.from_user.id, None)
@@ -469,14 +803,9 @@ async def cancel_add(callback: CallbackQuery):
         callback,
         "❌ <b>Додавання скасовано</b>",
         InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(
-                        text="🏠 Головна",
-                        callback_data="home"
-                    )
-                ]
-            ]
+            inline_keyboard=[[
+                InlineKeyboardButton(text="🏠 Головна", callback_data="home")
+            ]]
         )
     )
 
@@ -549,7 +878,8 @@ async def toggle_favorite(callback: CallbackQuery):
     db.commit()
 
     updated_song = get_song(song_id)
-    text, keyboard = song_card(updated_song)
+    semitones = TRANSPOSE_STATE.get(song_id, 0)
+    text, keyboard = song_card(updated_song, semitones)
 
     await edit_screen(callback, text, keyboard)
 
@@ -573,7 +903,8 @@ async def random_song(callback: CallbackQuery):
     song_id = random.choice(ids)
     song = get_song(song_id)
 
-    text, keyboard = song_card(song)
+    TRANSPOSE_STATE[song_id] = 0
+    text, keyboard = song_card(song, 0)
     await edit_screen(callback, text, keyboard)
 
 
@@ -664,6 +995,70 @@ async def text_handler(message: Message):
 
     if state:
         step = state["step"]
+
+        if step == "url":
+            if "mychords.net" not in text.lower():
+                await message.answer(
+                    "⚠️ Надішли саме посилання на пісню з <b>mychords.net</b>.",
+                    parse_mode="HTML"
+                )
+                return
+
+            wait_msg = await message.answer("⏳ Завантажую пісню з MyChords…")
+
+            try:
+                imported = await import_from_mychords(text)
+            except Exception as error:
+                await wait_msg.edit_text(
+                    "❌ <b>Не вдалося імпортувати пісню.</b>\n\n"
+                    f"{escape_html(str(error))}\n\n"
+                    "Можеш надіслати посилання ще раз або скасувати додавання.",
+                    parse_mode="HTML"
+                )
+                return
+
+            state["step"] = "confirm_import"
+            state["data"] = imported
+
+            preview = imported["lyrics"][:900]
+            if len(imported["lyrics"]) > 900:
+                preview += "\n…"
+
+            keyboard = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="✅ Зберегти",
+                            callback_data="save_import"
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            text="❌ Скасувати",
+                            callback_data="cancel_add"
+                        )
+                    ]
+                ]
+            )
+
+            await wait_msg.edit_text(
+                "🔎 <b>Перевір імпорт</b>\n\n"
+                f"🎵 <b>{escape_html(imported['title'])}</b>\n"
+                f"👤 {escape_html(imported['artist'])}\n"
+                f"🎸 Тональність: <b>{escape_html(imported['song_key'] or 'не визначена')}</b>\n\n"
+                f"<pre>{escape_html(preview)}</pre>\n\n"
+                "Якщо все виглядає правильно — натисни «✅ Зберегти».",
+                parse_mode="HTML",
+                reply_markup=keyboard
+            )
+            return
+
+        if step == "confirm_import":
+            await message.answer(
+                "Спочатку натисни <b>«✅ Зберегти»</b> або <b>«❌ Скасувати»</b> під попереднім переглядом.",
+                parse_mode="HTML"
+            )
+            return
 
         if step == "title":
             state["data"]["title"] = text

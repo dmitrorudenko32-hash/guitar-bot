@@ -72,7 +72,6 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL не знайдено в Environment")
 
-# autocommit=True: кожна зміна одразу зберігається у постійній БД.
 db = psycopg.connect(DATABASE_URL, autocommit=True)
 cursor = db.cursor()
 
@@ -223,11 +222,11 @@ NOTE_TO_INDEX = {
 }
 
 CHORD_RE = re.compile(
-    r"(%s<![A-Za-zА-Яа-яІіЇїЄєҐґ])"
-    r"([A-G])([#b]%s)(m|maj|min|dim|aug|sus)%s"
-    r"(\d{0,2})%s([+#-]%s\d*)%s"
-    r"(%s:/([A-G])([#b]%s))%s"
-    r"(%s![A-Za-zА-Яа-яІіЇїЄєҐґ])"
+    r"(?<![A-Za-zА-Яа-яІіЇїЄєҐґ])"
+    r"([A-G])([#b]?)(m|maj|min|dim|aug|sus)?"
+    r"(\d{0,2})?([+#-]?\d*)?"
+    r"(?:/([A-G])([#b]?))?"
+    r"(?![A-Za-zА-Яа-яІіЇїЄєҐґ])"
 )
 
 
@@ -309,14 +308,14 @@ def trim_mychords_text(text):
     # Початок самої пісні: секція або перший типовий музичний маркер.
     starts = []
     patterns = [
-        r"(%sim)^\[%sВступ\]%s\s*:%s",
-        r"(%sim)^\|%sВступ\|%s\s*:%s",
-        r"(%sim)^\[%sКуплет\s*\d*\]%s\s*:%s",
-        r"(%sim)^\|%sКуплет\s*\d*\|%s\s*:%s",
-        r"(%sim)^\[%sПриспів\]%s\s*:%s",
-        r"(%sim)^\|%sПриспів\|%s\s*:%s",
-        r"(%sim)^Капо(%s:дастр)%s\b",
-        r"(%sim)^акорди (%s:усієї|всієї) пісні\s*:",
+        r"(?im)^\[?Вступ\]?\s*:?",
+        r"(?im)^\|?Вступ\|?\s*:?",
+        r"(?im)^\[?Куплет\s*\d*\]?\s*:?",
+        r"(?im)^\|?Куплет\s*\d*\|?\s*:?",
+        r"(?im)^\[?Приспів\]?\s*:?",
+        r"(?im)^\|?Приспів\|?\s*:?",
+        r"(?im)^Капо(?:дастр)?\b",
+        r"(?im)^акорди (?:усієї|всієї) пісні\s*:",
     ]
     for pattern in patterns:
         m = re.search(pattern, text)
@@ -328,7 +327,7 @@ def trim_mychords_text(text):
 
     # Відсікаємо службовий хвіст MyChords.
     stops = [
-        "Все ще шукаєш правильні акорди%s",
+        "Все ще шукаєш правильні акорди?",
         "\nРедагувати\n",
         "\nПовідомити про помилку",
         "\nВідео від користувачів",
@@ -346,7 +345,7 @@ def trim_mychords_text(text):
 async def fetch_html(url):
     timeout = ClientTimeout(total=20)
     headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; GuitarBot/3.0; +https://t.me/)"
+        "User-Agent": "Mozilla/5.0 (compatible; GuitarBot/5.1; +https://t.me/)"
     }
     async with ClientSession(timeout=timeout, headers=headers) as session:
         async with session.get(url, allow_redirects=True) as response:
@@ -397,12 +396,12 @@ async def import_from_diez(url):
     # "Обійми — Океан Ельзи: акорди, текст, тональність | Diez"
     artist = ""
     page_title = soup.title.get_text(" ", strip=True) if soup.title else ""
-    m = re.match(r"(.+%s)\s+[—–-]\s+(.+%s)(%s::\s*акорди|[|])", page_title, re.I)
+    m = re.match(r"(.+?)\s+[—–-]\s+(.+?)(?::\s*акорди|[|])", page_title, re.I)
     if m:
         title = m.group(1).strip()
         artist = m.group(2).strip()
         artist = re.sub(
-            r"\s*:\s*(%s:текст пісні(%s: й акорди)%s|акорди.*)$",
+            r"\s*:\s*(?:текст пісні(?: й акорди)?|акорди.*)$",
             "",
             artist,
             flags=re.I
@@ -426,8 +425,10 @@ async def import_from_diez(url):
     lines = [x.strip() for x in raw.splitlines() if x.strip()]
 
     section_re = re.compile(
-        r"^(Вступ|Куплет(%s:\s*\d+)%s|Приспів(%s:\s*\d+)%s|"
-        r"Брідж|Міст|Кода|Програш|Передприспів|Постприспів)\s*:%s\s*$",
+        r"^(?:🎼|🎤|🔥|🎸|🌉|🏁|✨)?\s*"
+        r"(Вступ|Куплет(?:\s*\d+)?|Приспів(?:\s*\d+)?|"
+        r"Брідж|Міст|Кода|Програш|Передприспів|Постприспів)"
+        r"\s*:?\s*$",
         re.I
     )
 
@@ -473,11 +474,11 @@ async def import_from_diez(url):
             continue
 
         # Візуальні розділювачі/стрілки сайту.
-        if re.fullmatch(r"(%s:\.\s*){3,}", line):
+        if re.fullmatch(r"(?:\.\s*){3,}", line):
             continue
         if re.fullmatch(r"[↳←→‹›<>]+", line):
             continue
-        if re.fullmatch(r"\[%sButton:.*\]%s", line, re.I):
+        if re.fullmatch(r"\[?Button:.*\]?", line, re.I):
             continue
 
         song_lines.append(line)
@@ -490,9 +491,9 @@ async def import_from_diez(url):
     # Визначаємо тональність за набором акордів, а не за першим акордом.
     # Наприклад для "Обійми": Cm, Gm, G#, G7, Fm -> Cm.
     chord_tokens = re.findall(
-        r"(%s<![A-Za-zА-Яа-яІіЇїЄєҐґ])"
-        r"([A-G](%s:#|b)%s(%s:m|maj|min|dim|aug|sus)%s(%s:\\d+)%s(%s:/[A-G](%s:#|b)%s)%s)"
-        r"(%s![A-Za-zА-Яа-яІіЇїЄєҐґ])",
+        r"(?<![A-Za-zА-Яа-яІіЇїЄєҐґ])"
+        r"([A-G](?:#|b)?(?:m|maj|min|dim|aug|sus)?(?:\\d+)?(?:/[A-G](?:#|b)?)?)"
+        r"(?![A-Za-zА-Яа-яІіЇїЄєҐґ])",
         lyrics
     )
 
@@ -506,7 +507,7 @@ async def import_from_diez(url):
 
     parsed_chords = []
     for token in chord_tokens:
-        mm = re.match(r"^([A-G](%s:#|b)%s)(.*)$", token)
+        mm = re.match(r"^([A-G](?:#|b)?)(.*)$", token)
         if not mm or mm.group(1) not in note_index:
             continue
         root = note_index[mm.group(1)]
@@ -582,7 +583,7 @@ async def import_from_telegram(url):
             "наприклад t.me/easy_chords/123."
         )
 
-    post_url = f"https://t.me/easy_chords/{parts[1]}%sembed=1&mode=tme"
+    post_url = f"https://t.me/easy_chords/{parts[1]}?embed=1&mode=tme"
     html = await fetch_html(post_url)
     soup = BeautifulSoup(html, "html.parser")
 
@@ -640,8 +641,8 @@ async def import_song_from_url(url):
 
 
 SECTION_RE = re.compile(
-    r"^(Вступ|Куплет(%s:\s*\d+)%s|Приспів(%s:\s*\d+)%s|"
-    r"Брідж|Міст|Кода|Програш|Передприспів|Постприспів)\s*:%s\s*$",
+    r"^(Вступ|Куплет(?:\s*\d+)?|Приспів(?:\s*\d+)?|"
+    r"Брідж|Міст|Кода|Програш|Передприспів|Постприспів)\s*:?\s*$",
     re.I
 )
 
@@ -655,9 +656,9 @@ def is_chord_line(line):
     for p in parts:
         token = p.strip("|[](){}.,:;")
         if re.fullmatch(
-            r"[A-G](%s:#|b)%s(%s:m|maj|min|dim|aug|sus)%s"
-            r"(%s:2|4|5|6|7|9|11|13)%s(%s:add\d+)%s"
-            r"(%s:/[A-G](%s:#|b)%s)%s",
+            r"[A-G](?:#|b)?(?:m|maj|min|dim|aug|sus)?"
+            r"(?:2|4|5|6|7|9|11|13)?(?:add\d+)?"
+            r"(?:/[A-G](?:#|b)?)?",
             token,
             re.I
         ):
@@ -991,7 +992,7 @@ async def transpose_song(callback: CallbackQuery):
     TRANSPOSE_STATE[song_id] = current
 
     cursor.execute(
-        "UPDATE songs SET transpose = %s WHERE id = %s",
+        "UPDATE songs SET transpose = ? WHERE id = %s",
         (current, song_id)
     )
 
@@ -1034,7 +1035,7 @@ async def begin_add_song(user_id, send_func):
 
     await send_func(
         "➕ <b>Додати пісню</b>\n\n"
-        "Як хочеш додати пісню%s",
+        "Як хочеш додати пісню?",
         parse_mode="HTML",
         reply_markup=keyboard
     )
@@ -1207,7 +1208,7 @@ async def toggle_favorite(callback: CallbackQuery):
     new_value = False if song[5] else True
 
     cursor.execute(
-        "UPDATE songs SET favorite = %s WHERE id = %s",
+        "UPDATE songs SET favorite = ? WHERE id = %s",
         (new_value, song_id)
     )
 
@@ -1278,7 +1279,7 @@ async def delete_request(callback: CallbackQuery):
 
     await edit_screen(
         callback,
-        f"⚠️ <b>Видалити пісню%s</b>\n\n"
+        f"⚠️ <b>Видалити пісню?</b>\n\n"
         f"🎵 {song[1]}\n"
         f"👤 {song[2]}",
         keyboard

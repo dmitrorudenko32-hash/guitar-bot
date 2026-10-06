@@ -311,107 +311,249 @@ def detect_key_from_text(text):
     return match.group(0) if match else ""
 
 
-async def import_from_mychords(url):
-    parsed = urlparse(url.strip())
-    host = parsed.netloc.lower().split(":")[0]
+def split_artist_title(heading):
+    heading = " ".join((heading or "").split())
+    for sep in (" - ", " — ", " – "):
+        if sep in heading:
+            artist, title = heading.split(sep, 1)
+            return artist.strip(), title.strip()
+    return "Невідомий виконавець", heading.strip()
 
-    if host not in {"mychords.net", "www.mychords.net"}:
-        raise ValueError("Поки підтримується імпорт тільки з mychords.net")
 
+def trim_mychords_text(text):
+    text = clean_song_text(text)
+
+    # Початок самої пісні: секція або перший типовий музичний маркер.
+    starts = []
+    patterns = [
+        r"(?im)^\[?Вступ\]?\s*:?",
+        r"(?im)^\|?Вступ\|?\s*:?",
+        r"(?im)^\[?Куплет\s*\d*\]?\s*:?",
+        r"(?im)^\|?Куплет\s*\d*\|?\s*:?",
+        r"(?im)^\[?Приспів\]?\s*:?",
+        r"(?im)^\|?Приспів\|?\s*:?",
+        r"(?im)^Капо(?:дастр)?\b",
+        r"(?im)^акорди (?:усієї|всієї) пісні\s*:",
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, text)
+        if m:
+            starts.append(m.start())
+
+    if starts:
+        text = text[min(starts):]
+
+    # Відсікаємо службовий хвіст MyChords.
+    stops = [
+        "Все ще шукаєш правильні акорди?",
+        "\nРедагувати\n",
+        "\nПовідомити про помилку",
+        "\nВідео від користувачів",
+        "\nВідео\n",
+        "\nКоментарі",
+    ]
+    cut = len(text)
+    for phrase in stops:
+        pos = text.find(phrase)
+        if pos >= 80:
+            cut = min(cut, pos)
+    return text[:cut].strip()
+
+
+async def fetch_html(url):
     timeout = ClientTimeout(total=20)
     headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; GuitarBot/2.0)"
+        "User-Agent": "Mozilla/5.0 (compatible; GuitarBot/3.0; +https://t.me/)"
     }
-
     async with ClientSession(timeout=timeout, headers=headers) as session:
-        async with session.get(url) as response:
+        async with session.get(url, allow_redirects=True) as response:
             if response.status != 200:
-                raise ValueError(f"MyChords повернув помилку HTTP {response.status}")
-            html = await response.text()
+                raise ValueError(f"Сайт повернув помилку HTTP {response.status}")
+            return await response.text()
 
+
+async def import_from_mychords(url):
+    html = await fetch_html(url)
     soup = BeautifulSoup(html, "html.parser")
 
     h1 = soup.find("h1")
     if not h1:
-        raise ValueError("Не вдалося знайти назву пісні на сторінці.")
+        raise ValueError("Не вдалося знайти назву пісні на MyChords.")
 
-    heading = " ".join(h1.get_text(" ", strip=True).split())
-    if " - " in heading:
-        artist, title = heading.split(" - ", 1)
-    else:
-        artist, title = "Невідомий виконавець", heading
+    artist, title = split_artist_title(h1.get_text(" ", strip=True))
 
-    # MyChords змінював верстку кілька разів, тому шукаємо блок
-    # не за одним жорстким класом, а за кількома ознаками.
-    candidates = []
-    selectors = [
-        "[class*='song-text']", "[class*='song_text']",
-        "[class*='lyrics']", "[class*='chord']",
-        "[id*='song-text']", "[id*='song_text']",
-        "[id*='lyrics']", "[id*='chord']",
-        "pre"
-    ]
+    # На MyChords потрібний текст зазвичай міститься в основній частині сторінки.
+    # Беремо текст сторінки, а потім обрізаємо його від першої музичної секції.
+    page_text = soup.get_text("\n", strip=True)
+    lyrics = trim_mychords_text(page_text)
 
-    seen = set()
-    for selector in selectors:
-        for tag in soup.select(selector):
-            ident = id(tag)
-            if ident in seen:
-                continue
-            seen.add(ident)
-            txt = tag.get_text("\n", strip=False)
-            if len(txt) >= 120:
-                chord_count = len(CHORD_RE.findall(txt))
-                score = chord_count * 20 + min(len(txt), 10000) / 100
-                if "Приспів" in txt or "Припев" in txt:
-                    score += 100
-                if "Вступ" in txt or "Вступление" in txt:
-                    score += 100
-                candidates.append((score, txt))
-
-    # Запасний варіант: шукаємо найбільш схожий великий контейнер.
-    if not candidates:
-        for tag in soup.find_all(["div", "article", "section"]):
-            txt = tag.get_text("\n", strip=False)
-            if 150 <= len(txt) <= 20000:
-                chord_count = len(CHORD_RE.findall(txt))
-                if chord_count >= 4:
-                    score = chord_count * 20 + min(len(txt), 10000) / 100
-                    if "Приспів" in txt:
-                        score += 100
-                    candidates.append((score, txt))
-
-    if not candidates:
-        raise ValueError(
-            "Не вдалося автоматично знайти текст з акордами. "
-            "Можливо, MyChords змінив верстку."
-        )
-
-    candidates.sort(key=lambda item: item[0], reverse=True)
-    lyrics = clean_song_text(candidates[0][1])
-
-    # Відсікаємо очевидний службовий хвіст, якщо він потрапив у контейнер.
-    stop_phrases = [
-        "Все ще шукаєш правильні акорди?",
-        "Редагувати\nПовідомити про помилку",
-        "Повідомити про помилку",
-        "Останні коментарі",
-    ]
-    for phrase in stop_phrases:
-        pos = lyrics.find(phrase)
-        if pos > 100:
-            lyrics = lyrics[:pos].strip()
-
-    if len(lyrics) < 80:
-        raise ValueError("Знайдений текст виглядає неповним.")
+    if len(lyrics) < 80 or len(CHORD_RE.findall(lyrics)) < 2:
+        raise ValueError("Не вдалося чисто витягнути акорди з MyChords.")
 
     return {
-        "title": title.strip(),
-        "artist": artist.strip(),
+        "title": title,
+        "artist": artist,
         "song_key": detect_key_from_text(lyrics),
         "lyrics": lyrics,
         "source_url": url.strip(),
+        "source": "MyChords",
     }
+
+
+async def import_from_diez(url):
+    html = await fetch_html(url)
+    soup = BeautifulSoup(html, "html.parser")
+
+    h1 = soup.find("h1")
+    if not h1:
+        raise ValueError("Не вдалося знайти назву пісні на Diez.")
+
+    title = " ".join(h1.get_text(" ", strip=True).split())
+
+    # У Diez виконавець зазвичай стоїть безпосередньо перед H1.
+    artist = ""
+    prev = h1.find_previous()
+    checked = 0
+    while prev and checked < 15:
+        txt = " ".join(prev.get_text(" ", strip=True).split())
+        if txt and txt != title and len(txt) <= 100:
+            # Відсікаємо типові елементи інтерфейсу.
+            low = txt.lower()
+            if not any(x in low for x in (
+                "акорди", "текст пісні", "транспон", "увійти",
+                "реєстра", "головна", "пісні"
+            )):
+                artist = txt
+                break
+        prev = prev.find_previous()
+        checked += 1
+
+    if not artist:
+        # Часто title сторінки має формат "Назва — Виконавець: ..."
+        page_title = soup.title.get_text(" ", strip=True) if soup.title else ""
+        m = re.match(r"(.+?)\s+[—–-]\s+(.+?)(?::| \|)", page_title)
+        if m:
+            title = m.group(1).strip()
+            artist = m.group(2).strip()
+
+    if not artist:
+        artist = "Невідомий виконавець"
+
+    # Вибираємо контейнер, у якому є H1 і найбільше акордів.
+    candidates = []
+    node = h1
+    for _ in range(8):
+        node = node.parent
+        if not node:
+            break
+        txt = node.get_text("\n", strip=True)
+        chord_count = len(CHORD_RE.findall(txt))
+        if 80 <= len(txt) <= 25000 and chord_count >= 2:
+            score = chord_count * 50 - len(txt) / 100
+            if re.search(r"(?i)\b(Вступ|Куплет|Приспів|Кода)\b", txt):
+                score += 500
+            candidates.append((score, txt))
+
+    if not candidates:
+        raise ValueError("Не вдалося знайти текст з акордами на Diez.")
+
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    lyrics = clean_song_text(candidates[0][1])
+
+    # Прибираємо заголовок/виконавця з початку контейнера.
+    lines = lyrics.splitlines()
+    while lines and lines[0].strip() in {artist, title}:
+        lines.pop(0)
+    lyrics = "\n".join(lines).strip()
+
+    # Обрізаємо SEO-пояснення після пісні.
+    for phrase in (
+        "Це повний текст пісні",
+        "Схожі пісні",
+        "Інші пісні",
+        "Коментарі",
+    ):
+        pos = lyrics.find(phrase)
+        if pos >= 80:
+            lyrics = lyrics[:pos].strip()
+
+    if len(lyrics) < 80:
+        raise ValueError("Знайдений текст Diez виглядає неповним.")
+
+    return {
+        "title": title,
+        "artist": artist,
+        "song_key": detect_key_from_text(lyrics),
+        "lyrics": lyrics,
+        "source_url": url.strip(),
+        "source": "Diez",
+    }
+
+
+async def import_from_telegram(url):
+    parsed = urlparse(url.strip())
+    parts = [p for p in parsed.path.split("/") if p]
+
+    if len(parts) < 2 or parts[0].lower() != "easy_chords" or not parts[1].isdigit():
+        raise ValueError(
+            "Для Telegram надішли посилання саме на конкретний допис, "
+            "наприклад t.me/easy_chords/123."
+        )
+
+    post_url = f"https://t.me/easy_chords/{parts[1]}?embed=1&mode=tme"
+    html = await fetch_html(post_url)
+    soup = BeautifulSoup(html, "html.parser")
+
+    text_node = soup.select_one(".tgme_widget_message_text")
+    if not text_node:
+        raise ValueError(
+            "У цьому дописі не знайдено тексту. "
+            "Якщо акорди тільки на фото/відео, v3 поки не може їх прочитати."
+        )
+
+    post_text = clean_song_text(text_node.get_text("\n", strip=True))
+    if len(post_text) < 20:
+        raise ValueError("Текст допису занадто короткий для імпорту.")
+
+    # Спроба визначити назву/виконавця з перших змістовних рядків.
+    lines = [x.strip() for x in post_text.splitlines() if x.strip()]
+    artist = "easy_chords"
+    title = lines[0][:120] if lines else f"Допиc {parts[1]}"
+
+    # Якщо перший рядок схожий на "Виконавець — Назва".
+    a, t = split_artist_title(title)
+    if a != "Невідомий виконавець":
+        artist, title = a, t
+
+    return {
+        "title": title,
+        "artist": artist,
+        "song_key": detect_key_from_text(post_text),
+        "lyrics": post_text,
+        "source_url": url.strip(),
+        "source": "Telegram easy_chords",
+    }
+
+
+async def import_song_from_url(url):
+    parsed = urlparse(url.strip())
+    host = parsed.netloc.lower().split(":")[0]
+    if host.startswith("www."):
+        host = host[4:]
+
+    if host == "mychords.net":
+        return await import_from_mychords(url)
+
+    if host == "diez.net.ua":
+        return await import_from_diez(url)
+
+    if host in {"t.me", "telegram.me"}:
+        return await import_from_telegram(url)
+
+    raise ValueError(
+        "Цей сайт поки не підтримується.\n"
+        "Підтримуються: MyChords, Diez та дописи t.me/easy_chords."
+    )
 
 
 def song_card(song, semitones=0):
@@ -680,7 +822,7 @@ async def begin_add_song(user_id, send_func):
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="🔗 За посиланням MyChords",
+                    text="🔗 За посиланням",
                     callback_data="add_by_url"
                 )
             ],
@@ -727,10 +869,12 @@ async def add_by_url(callback: CallbackQuery):
 
     await edit_screen(
         callback,
-        "🔗 <b>Імпорт з MyChords</b>\n\n"
-        "Надішли мені посилання на пісню з <b>mychords.net</b>.\n\n"
-        "Наприклад:\n"
-        "<code>https://mychords.net/uk/...</code>",
+        "🔗 <b>Імпорт за посиланням</b>\n\n"
+        "Надішли посилання на пісню.\n\n"
+        "Підтримую:\n"
+        "• <b>Diez</b>\n"
+        "• <b>MyChords</b>\n"
+        "• конкретні дописи <b>t.me/easy_chords/...</b>",
         InlineKeyboardMarkup(
             inline_keyboard=[[
                 InlineKeyboardButton(text="❌ Скасувати", callback_data="cancel_add")
@@ -997,17 +1141,17 @@ async def text_handler(message: Message):
         step = state["step"]
 
         if step == "url":
-            if "mychords.net" not in text.lower():
+            if not text.lower().startswith(("http://", "https://")):
                 await message.answer(
-                    "⚠️ Надішли саме посилання на пісню з <b>mychords.net</b>.",
+                    "⚠️ Надішли повне посилання, яке починається з <b>https://</b>.",
                     parse_mode="HTML"
                 )
                 return
 
-            wait_msg = await message.answer("⏳ Завантажую пісню з MyChords…")
+            wait_msg = await message.answer("⏳ Завантажую пісню…")
 
             try:
-                imported = await import_from_mychords(text)
+                imported = await import_song_from_url(text)
             except Exception as error:
                 await wait_msg.edit_text(
                     "❌ <b>Не вдалося імпортувати пісню.</b>\n\n"
@@ -1043,6 +1187,7 @@ async def text_handler(message: Message):
 
             await wait_msg.edit_text(
                 "🔎 <b>Перевір імпорт</b>\n\n"
+                f"🌐 Джерело: <b>{escape_html(imported.get('source', 'Посилання'))}</b>\n"
                 f"🎵 <b>{escape_html(imported['title'])}</b>\n"
                 f"👤 {escape_html(imported['artist'])}\n"
                 f"🎸 Тональність: <b>{escape_html(imported['song_key'] or 'не визначена')}</b>\n\n"

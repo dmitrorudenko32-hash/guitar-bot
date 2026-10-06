@@ -92,6 +92,9 @@ if "source_url" not in existing_columns:
 if "capo" not in existing_columns:
     cursor.execute("ALTER TABLE songs ADD COLUMN capo INTEGER NOT NULL DEFAULT 0")
 
+if "transpose" not in existing_columns:
+    cursor.execute("ALTER TABLE songs ADD COLUMN transpose INTEGER NOT NULL DEFAULT 0")
+
 db.commit()
 
 
@@ -214,7 +217,8 @@ def bottom_keyboard():
 def get_song(song_id):
     cursor.execute("""
         SELECT id, title, artist, song_key, lyrics, favorite,
-               COALESCE(source_url, ''), COALESCE(capo, 0)
+               COALESCE(source_url, ''), COALESCE(capo, 0),
+               COALESCE(transpose, 0)
         FROM songs
         WHERE id = ?
     """, (song_id,))
@@ -655,8 +659,110 @@ async def import_song_from_url(url):
     )
 
 
-def song_card(song, semitones=0):
-    song_id, title, artist, song_key, lyrics, favorite, source_url, capo = song
+
+SECTION_RE = re.compile(
+    r"^(Вступ|Куплет(?:\s*\d+)?|Приспів(?:\s*\d+)?|"
+    r"Брідж|Міст|Кода|Програш|Передприспів|Постприспів)\s*:?\s*$",
+    re.I
+)
+
+def is_chord_line(line):
+    """True if the whole line consists mainly of chord symbols."""
+    parts = [p for p in re.split(r"\s+", line.strip()) if p]
+    if not parts:
+        return False
+
+    musical = 0
+    for p in parts:
+        token = p.strip("|[](){}.,:;")
+        if re.fullmatch(
+            r"[A-G](?:#|b)?(?:m|maj|min|dim|aug|sus)?"
+            r"(?:2|4|5|6|7|9|11|13)?(?:add\d+)?"
+            r"(?:/[A-G](?:#|b)?)?",
+            token,
+            re.I
+        ):
+            musical += 1
+        elif re.fullmatch(r"x\d+", token, re.I):
+            musical += 1
+
+    return musical == len(parts)
+
+
+def pretty_song_lyrics(lyrics, semitones=0):
+    """Telegram-friendly view: section headers + bold monospace chords."""
+    source = transpose_text(lyrics, semitones) if semitones else lyrics
+    out = []
+
+    icons = {
+        "вступ": "🎼",
+        "куплет": "🎤",
+        "приспів": "🔥",
+        "брідж": "🌉",
+        "міст": "🌉",
+        "кода": "🏁",
+        "програш": "🎸",
+        "передприспів": "✨",
+        "постприспів": "✨",
+    }
+
+    for raw in source.splitlines():
+        line = raw.strip()
+
+        if not line:
+            out.append("")
+            continue
+
+        sm = SECTION_RE.match(line)
+        if sm:
+            section = sm.group(1)
+            key = re.match(r"[А-Яа-яІіЇїЄєҐґ]+", section)
+            key = key.group(0).lower() if key else ""
+            icon = icons.get(key, "🎵")
+            out.append("")
+            out.append(
+                f"<b>━━ {icon} {escape_html(section.upper())} ━━</b>"
+            )
+            continue
+
+        if is_chord_line(line):
+            # Telegram doesn't support arbitrary font colors.
+            # Bold + monospace makes chords visually distinct.
+            out.append(f"<b><code>{escape_html(line)}</code></b>")
+        else:
+            out.append(escape_html(line))
+
+    # Avoid excessive empty lines.
+    cleaned = []
+    last_blank = False
+    for x in out:
+        blank = (x == "")
+        if blank and last_blank:
+            continue
+        cleaned.append(x)
+        last_blank = blank
+
+    return "\n".join(cleaned).strip()
+
+
+def trim_html_message(text, limit=3300):
+    """Keep Telegram message safely below its 4096-char limit."""
+    if len(text) <= limit:
+        return text
+
+    cut = text[:limit]
+    pos = cut.rfind("\n")
+    if pos > limit - 500:
+        cut = cut[:pos]
+
+    # We only trim at complete lines, so close any simple tags defensively.
+    return cut.rstrip() + "\n\n<i>…пісня довша, показано частину</i>"
+
+def song_card(song, semitones=None):
+    song_id, title, artist, song_key, lyrics, favorite, source_url, capo, saved_transpose = song
+
+    if semitones is None:
+        semitones = int(saved_transpose or 0)
 
     star = "⭐" if favorite else "☆"
     shown_key = transpose_key(song_key, semitones) if song_key else "не вказана"
@@ -865,8 +971,9 @@ async def open_song(callback: CallbackQuery):
         )
         return
 
-    TRANSPOSE_STATE[song_id] = 0
-    text, keyboard = song_card(song, 0)
+    saved_transpose = int(song[8] or 0)
+    TRANSPOSE_STATE[song_id] = saved_transpose
+    text, keyboard = song_card(song, saved_transpose)
     await edit_screen(callback, text, keyboard)
 
 
@@ -889,7 +996,7 @@ async def transpose_song(callback: CallbackQuery):
         await callback.answer("Пісню вже видалено.", show_alert=True)
         return
 
-    current = TRANSPOSE_STATE.get(song_id, 0)
+    current = TRANSPOSE_STATE.get(song_id, int(song[8] or 0))
 
     if action == "+":
         current += 1
@@ -905,6 +1012,15 @@ async def transpose_song(callback: CallbackQuery):
         current = 0
 
     TRANSPOSE_STATE[song_id] = current
+
+    cursor.execute(
+        "UPDATE songs SET transpose = ? WHERE id = ?",
+        (current, song_id)
+    )
+    db.commit()
+
+    # Оновлюємо tuple, щоб картка вже містила актуальне збережене значення.
+    song = get_song(song_id)
     text, keyboard = song_card(song, current)
     await edit_screen(callback, text, keyboard)
 
@@ -1121,7 +1237,7 @@ async def toggle_favorite(callback: CallbackQuery):
     db.commit()
 
     updated_song = get_song(song_id)
-    semitones = TRANSPOSE_STATE.get(song_id, 0)
+    semitones = TRANSPOSE_STATE.get(song_id, int(updated_song[8] or 0))
     text, keyboard = song_card(updated_song, semitones)
 
     await edit_screen(callback, text, keyboard)
@@ -1146,8 +1262,9 @@ async def random_song(callback: CallbackQuery):
     song_id = random.choice(ids)
     song = get_song(song_id)
 
-    TRANSPOSE_STATE[song_id] = 0
-    text, keyboard = song_card(song, 0)
+    saved_transpose = int(song[8] or 0)
+    TRANSPOSE_STATE[song_id] = saved_transpose
+    text, keyboard = song_card(song, saved_transpose)
     await edit_screen(callback, text, keyboard)
 
 

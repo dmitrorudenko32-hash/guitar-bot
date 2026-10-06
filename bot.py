@@ -418,6 +418,12 @@ async def import_from_diez(url):
     if m:
         title = m.group(1).strip()
         artist = m.group(2).strip()
+        artist = re.sub(
+            r"\s*:\s*(?:текст пісні(?: й акорди)?|акорди.*)$",
+            "",
+            artist,
+            flags=re.I
+        ).strip()
 
     if not artist:
         # запасний варіант: посилання на виконавця перед H1
@@ -455,15 +461,19 @@ async def import_from_diez(url):
     for line in lines[first:]:
         low = line.lower()
 
-        # Кінець основного блоку пісні.
+        # На Diez після першого повного варіанта можуть іти
+        # "Рекомендований бій", "для зручності: -3" і повтор пісні.
+        # Для пісенника залишаємо лише перший основний варіант.
         if (
-            "можна грати на гітарі" in low
+            low.startswith("рекомендований бій")
+            or low.startswith("для зручності")
+            or "можна грати на гітарі" in low
             or line == "Поскаржитись"
             or line == "Українські пісні, тексти й акорди для гри та співу."
         ):
             break
 
-        # Службові елементи Diez, якщо раптом трапляться всередині.
+        # Службові елементи Diez.
         if line in {
             "Режим для новачка",
             "Тональність і аплікатури без баре",
@@ -475,12 +485,16 @@ async def import_from_diez(url):
             "Тюнер",
             "Без баре",
             "Розмір тексту",
+            "↳",
         }:
             continue
 
-        if re.fullmatch(r"\[?Button:.*\]?", line, re.I):
+        # Візуальні розділювачі/стрілки сайту.
+        if re.fullmatch(r"(?:\.\s*){3,}", line):
             continue
-        if re.fullmatch(r"[‹›<>]", line):
+        if re.fullmatch(r"[↳←→‹›<>]+", line):
+            continue
+        if re.fullmatch(r"\[?Button:.*\]?", line, re.I):
             continue
 
         song_lines.append(line)
@@ -490,31 +504,81 @@ async def import_from_diez(url):
     if len(lyrics) < 80 or len(CHORD_RE.findall(lyrics)) < 2:
         raise ValueError("Знайдений текст Diez виглядає неповним.")
 
-    # Не вважаємо перший акорд тональністю. На Diez він може бути
-    # домінантним/вступним (наприклад G7), тому шукаємо найчастіший
-    # кореневий акорд у пісні.
-    roots = []
-    for chord in CHORD_RE.findall(lyrics):
-        if isinstance(chord, tuple):
-            chord = chord[0]
-        token = str(chord)
-        mm = re.match(r"^([A-G](?:#|b)?)", token)
-        if mm:
-            roots.append(mm.group(1))
+    # Визначаємо тональність за набором акордів, а не за першим акордом.
+    # Наприклад для "Обійми": Cm, Gm, G#, G7, Fm -> Cm.
+    chord_tokens = re.findall(
+        r"(?<![A-Za-zА-Яа-яІіЇїЄєҐґ])"
+        r"([A-G](?:#|b)?(?:m|maj|min|dim|aug|sus)?(?:\\d+)?(?:/[A-G](?:#|b)?)?)"
+        r"(?![A-Za-zА-Яа-яІіЇїЄєҐґ])",
+        lyrics
+    )
+
+    note_index = {
+        "C": 0, "C#": 1, "Db": 1, "D": 2, "D#": 3, "Eb": 3,
+        "E": 4, "F": 5, "F#": 6, "Gb": 6, "G": 7, "G#": 8,
+        "Ab": 8, "A": 9, "A#": 10, "Bb": 10, "B": 11,
+    }
+    sharp_name = ["C", "C#", "D", "D#", "E", "F",
+                  "F#", "G", "G#", "A", "A#", "B"]
+
+    parsed_chords = []
+    for token in chord_tokens:
+        mm = re.match(r"^([A-G](?:#|b)?)(.*)$", token)
+        if not mm or mm.group(1) not in note_index:
+            continue
+        root = note_index[mm.group(1)]
+        suffix = mm.group(2).split("/")[0].lower()
+        is_minor = suffix.startswith("m") and not suffix.startswith("maj")
+        parsed_chords.append((root, is_minor, token))
+
+    def key_score(tonic, minor):
+        # Діатонічні тризвуки + бонус домінанті V/V7.
+        if minor:
+            expected = {
+                (tonic + 0) % 12: "m",
+                (tonic + 2) % 12: "dim",
+                (tonic + 3) % 12: "M",
+                (tonic + 5) % 12: "m",
+                (tonic + 7) % 12: "M",   # harmonic minor dominant
+                (tonic + 8) % 12: "M",
+                (tonic + 10) % 12: "M",
+            }
+        else:
+            expected = {
+                (tonic + 0) % 12: "M",
+                (tonic + 2) % 12: "m",
+                (tonic + 4) % 12: "m",
+                (tonic + 5) % 12: "M",
+                (tonic + 7) % 12: "M",
+                (tonic + 9) % 12: "m",
+                (tonic + 11) % 12: "dim",
+            }
+
+        score = 0.0
+        for root, is_minor, token in parsed_chords:
+            quality = "m" if is_minor else "M"
+            exp = expected.get(root)
+            if exp:
+                score += 2.0
+                if exp == quality:
+                    score += 1.5
+            if root == tonic:
+                score += 1.0
+                if is_minor == minor:
+                    score += 1.5
+            # V7 дуже сильна підказка до тоніки.
+            if root == (tonic + 7) % 12 and "7" in token:
+                score += 2.5
+        return score
 
     song_key = detect_key_from_text(lyrics)
-    if roots:
-        from collections import Counter
-        root = Counter(roots).most_common(1)[0][0]
-
-        # Визначаємо major/minor за найчастішими акордами цього кореня.
-        minor_count = len(re.findall(
-            rf"(?<![A-G#b]){re.escape(root)}m(?:\b|(?=[0-9/]))", lyrics
-        ))
-        major_count = len(re.findall(
-            rf"(?<![A-G#b]){re.escape(root)}(?![#bm])(?:\d+)?(?:\b|/)", lyrics
-        ))
-        song_key = root + ("m" if minor_count > major_count else "")
+    if parsed_chords:
+        candidates = []
+        for tonic in range(12):
+            candidates.append((key_score(tonic, False), tonic, False))
+            candidates.append((key_score(tonic, True), tonic, True))
+        _, tonic, minor = max(candidates, key=lambda x: x[0])
+        song_key = sharp_name[tonic] + ("m" if minor else "")
 
     return {
         "title": title,

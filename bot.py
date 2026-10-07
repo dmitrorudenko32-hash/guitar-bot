@@ -379,7 +379,7 @@ async def import_from_mychords(url):
         "title": title,
         "artist": artist,
         "song_key": detect_key_from_text(lyrics),
-        "lyrics": lyrics,
+        "lyrics": normalize_song_text(lyrics),
         "source_url": url.strip(),
         "source": "MyChords",
     }
@@ -571,7 +571,7 @@ async def import_from_diez(url):
         "title": title,
         "artist": artist,
         "song_key": song_key,
-        "lyrics": lyrics,
+        "lyrics": normalize_song_text(lyrics),
         "source_url": url.strip(),
         "source": "Diez",
     }
@@ -823,6 +823,86 @@ def _font(size, bold=False):
         if os.path.exists(p):
             return ImageFont.truetype(p, size)
     return ImageFont.load_default()
+
+def normalize_song_text(text):
+    """
+    v6.8 common internal format for Diez / MyChords / easy_chords / manual input.
+    Keeps lyrics intact, standardizes section headings, whitespace and chord rows.
+    """
+    if not text:
+        return ""
+
+    text = str(text).replace("\r\n", "\n").replace("\r", "\n")
+    text = text.replace("\u00a0", " ").replace("\u200b", "")
+
+    section_map = {
+        "вступ": "ВСТУП",
+        "intro": "ВСТУП",
+        "куплет": "КУПЛЕТ",
+        "verse": "КУПЛЕТ",
+        "приспів": "ПРИСПІВ",
+        "припев": "ПРИСПІВ",
+        "chorus": "ПРИСПІВ",
+        "брідж": "БРІДЖ",
+        "бридж": "БРІДЖ",
+        "bridge": "БРІДЖ",
+        "програш": "ПРОГРАШ",
+        "проигрыш": "ПРОГРАШ",
+        "instrumental": "ПРОГРАШ",
+        "кінцівка": "КІНЦІВКА",
+        "концовка": "КІНЦІВКА",
+        "outro": "КІНЦІВКА",
+    }
+
+    out = []
+    blank = False
+
+    for raw in text.split("\n"):
+        line = raw.strip()
+
+        if not line:
+            if out and not blank:
+                out.append("")
+            blank = True
+            continue
+        blank = False
+
+        # Normalize common source decorations.
+        line = re.sub(r"^[\-\–\—•·]+\s*", "", line).strip()
+        line = re.sub(r"\s+", " ", line)
+
+        # Standardize section names, preserving a number such as "Куплет 2".
+        sec = re.match(
+            r"^(вступ|intro|куплет|verse|приспів|припев|chorus|брідж|бридж|bridge|"
+            r"програш|проигрыш|instrumental|кінцівка|концовка|outro)"
+            r"\s*[:.\-]?\s*(\d+)?\s*:?\s*$",
+            line, re.I
+        )
+        if sec:
+            base = section_map.get(sec.group(1).lower(), sec.group(1).upper())
+            num = sec.group(2)
+            line = f"{base} {num}" if num else base
+            out.append(line)
+            continue
+
+        # Standardize chord-only rows without changing the chords themselves.
+        tokens = [t for t in re.split(r"\s+", line) if t]
+        if tokens:
+            cleaned = [t.strip("|[](){}.,:;") for t in tokens]
+            chord_count = sum(bool(CHORD_TOKEN_RE.fullmatch(t)) for t in cleaned)
+            if chord_count == len(cleaned):
+                line = " ".join(cleaned)
+
+        out.append(line)
+
+    # Avoid excessive blank lines.
+    result = []
+    for line in out:
+        if line == "" and (not result or result[-1] == ""):
+            continue
+        result.append(line)
+    return "\n".join(result).strip()
+
 
 def _chords_from_line(line):
     out = []

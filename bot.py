@@ -348,7 +348,15 @@ def trim_mychords_text(text):
 async def fetch_html(url):
     timeout = ClientTimeout(total=20)
     headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; GuitarBot/5.1; +https://t.me/)"
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/154.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "uk-UA,uk;q=0.9,en;q=0.7",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
     }
     async with ClientSession(timeout=timeout, headers=headers) as session:
         async with session.get(url, allow_redirects=True) as response:
@@ -430,6 +438,7 @@ async def import_from_mychords(url):
         "lyrics": lyrics,
         "source_url": url.strip(),
         "source": "MyChords",
+        "debug_raw": "\n".join(raw_song[:20]),
     }
 
 
@@ -2016,6 +2025,14 @@ async def text_handler(message: Message):
             if len(imported["lyrics"]) > 900:
                 preview += "\n…"
 
+            debug_raw = imported.get("debug_raw", "")
+            debug_block = ""
+            if debug_raw:
+                debug_block = (
+                    "\n\n🧪 <b>RAW MyChords з Render:</b>\n"
+                    f"<pre>{escape_html(debug_raw[:700])}</pre>"
+                )
+
             keyboard = InlineKeyboardMarkup(
                 inline_keyboard=[
                     [
@@ -2039,7 +2056,8 @@ async def text_handler(message: Message):
                 f"🎵 <b>{escape_html(imported['title'])}</b>\n"
                 f"👤 {escape_html(imported['artist'])}\n"
                 f"🎸 Тональність: <b>{escape_html(imported['song_key'] or 'не визначена')}</b>\n\n"
-                f"<pre>{escape_html(preview)}</pre>\n\n"
+                f"<pre>{escape_html(preview)}</pre>"
+                f"{debug_block}\n\n"
                 "Якщо все виглядає правильно — натисни «✅ Зберегти».",
                 parse_mode="HTML",
                 reply_markup=keyboard

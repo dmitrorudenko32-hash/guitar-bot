@@ -367,118 +367,83 @@ async def fetch_html(url):
 
 async def import_from_mychords(url):
     """
-    MyChords has at least two stored/cached versions of some songs.
-    Render can receive an old version while the public/indexed page is newer.
-    To avoid the stale /uk edge, request the same song through all MyChords
-    language routes and select the majority version by its actual chord+lyric text.
+    MyChords parser based on the proven chords-fetcher approach:
+    use only div.w-words__text and explicit a.b-chord elements.
     """
-    parsed = urlparse(url.strip())
-    parts = [p for p in parsed.path.split("/") if p]
+    html = await fetch_html(url)
+    soup = BeautifulSoup(html, "html.parser")
 
-    # Strip language prefix if present.
-    if parts and parts[0].lower() in {"uk", "ru", "en", "de"}:
-        song_parts = parts[1:]
-    else:
-        song_parts = parts
+    h1 = soup.find("h1")
+    if not h1:
+        raise ValueError("Не вдалося знайти назву пісні на MyChords.")
+    artist, title = split_artist_title(h1.get_text(" ", strip=True))
 
-    song_path = "/" + "/".join(song_parts)
-    host = parsed.netloc or "mychords.net"
+    song_div = soup.find("div", class_="w-words__text")
+    if not song_div:
+        raise ValueError("MyChords: не знайдено блок пісні w-words__text.")
 
-    # Current MyChords pages are mirrored across language routes.
-    # Web verification shows the corrected version of this song on /uk, /ru
-    # and the language-neutral route, so do not trust one Render edge response.
-    urls = [
-        f"https://{host}/uk{song_path}",
-        f"https://{host}/ru{song_path}",
-        f"https://{host}/en{song_path}",
-        f"https://{host}{song_path}",
-    ]
+    # Preserve visual line breaks from the song block.
+    for br in song_div.find_all("br"):
+        br.replace_with("\n")
 
-    variants = []
-    title = ""
-    artist = ""
+    # Mark chord anchors before extracting text so chords cannot merge into lyrics.
+    for a in song_div.find_all("a", class_="b-chord"):
+        chord = a.get_text(" ", strip=True)
+        a.replace_with(f" {chord} ")
 
-    for candidate_url in urls:
-        try:
-            html = await fetch_html(candidate_url)
-            soup = BeautifulSoup(html, "html.parser")
+    text = song_div.get_text()
 
-            h1 = soup.find("h1")
-            if h1 and not title:
-                artist, title = split_artist_title(h1.get_text(" ", strip=True))
-
-            lines = [
-                x.strip()
-                for x in soup.get_text("\n", strip=True).replace("\r", "").splitlines()
-                if x.strip()
-            ]
-
-            start_i = next(i for i, x in enumerate(lines) if x.lower() in {"стоп", "stop"}) + 1
-
-            stop_words = {"редагувати", "редактировать", "edit"}
-            end_i = next(
-                (i for i in range(start_i, len(lines)) if lines[i].lower() in stop_words),
-                len(lines)
-            )
-
-            raw = lines[start_i:end_i]
-            if raw:
-                # Fingerprint the actual song body, not URL/query metadata.
-                fp = "\n".join(raw)
-                variants.append((candidate_url, raw, fp))
-        except Exception:
-            continue
-
-    if not variants:
-        raise ValueError("Не вдалося отримати текст пісні з MyChords.")
-
-    # Group identical song bodies. Prefer the version returned by most language
-    # routes; this is safer than guessing a key or trying to 'transpose' stale data.
-    groups = {}
-    for candidate_url, raw, fp in variants:
-        groups.setdefault(fp, []).append((candidate_url, raw))
-
-    best_fp, best_group = max(
-        groups.items(),
-        key=lambda item: (len(item[1]), -urls.index(item[1][0][0]))
+    # Same idea as chords-fetcher: separate a chord if HTML glued it to a word.
+    text = re.sub(
+        r"([А-Яа-яІіЇїЄєA-Za-z])([A-G](?:#|b)?(?:m|maj|min|dim|aug|sus)?(?:2|4|5|6|7|9|11|13)?)",
+        r"\1 \2",
+        text
     )
-    raw_song = best_group[0][1]
+    text = re.sub(
+        r"([A-G](?:#|b)?(?:m|maj|min|dim|aug|sus)?(?:2|4|5|6|7|9|11|13)?)([А-Яа-яІіЇїЄєA-Za-z])",
+        r"\1 \2",
+        text
+    )
 
-    output = []
-    first_chord = ""
+    # Clean whitespace but preserve line structure.
+    raw_lines = []
+    for raw in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        line = re.sub(r"[ \t]+", " ", raw).strip()
+        raw_lines.append(line)
 
-    for line in raw_song:
-        parts2 = line.split()
-        chords = []
-        p = 0
+    while raw_lines and not raw_lines[0]:
+        raw_lines.pop(0)
+    while raw_lines and not raw_lines[-1]:
+        raw_lines.pop()
 
-        while p < len(parts2):
-            token = parts2[p].strip("`|[](){}.,:;")
-            if CHORD_TOKEN_RE.fullmatch(token):
-                chords.append(token)
-                if not first_chord:
-                    first_chord = token
-                p += 1
-            else:
-                break
+    # Collapse excessive blank lines only.
+    cleaned = []
+    for line in raw_lines:
+        if line or not cleaned or cleaned[-1]:
+            cleaned.append(line)
 
-        if chords:
-            output.append(" ".join(chords))
-            lyric = " ".join(parts2[p:]).strip()
-            if lyric:
-                output.append(lyric)
-        else:
-            output.append(line.strip())
+    lyrics = "\n".join(cleaned).strip()
 
-    lyrics = clean_song_text("\n".join(output))
+    if not lyrics:
+        raise ValueError("MyChords: блок пісні порожній.")
 
-    if not lyrics or len(CHORD_RE.findall(lyrics)) < 2:
+    chords = []
+    for a in soup.select("div.w-words__text a.b-chord"):
+        chord = a.get_text(" ", strip=True)
+        if chord and CHORD_TOKEN_RE.fullmatch(chord):
+            chords.append(chord)
+
+    # Fallback in case MyChords changes anchors but text remains usable.
+    if not chords:
+        chords = CHORD_RE.findall(lyrics)
+
+    if len(chords) < 2:
         raise ValueError("Не вдалося витягнути акорди з MyChords.")
 
     return {
-        "title": title or "Без назви",
-        "artist": artist or "Невідомий виконавець",
-        "song_key": first_chord or detect_key_from_text(lyrics),
+        "title": title,
+        "artist": artist,
+        "song_key": chords[0] if chords else detect_key_from_text(lyrics),
         "lyrics": lyrics,
         "source_url": url.strip(),
         "source": "MyChords",

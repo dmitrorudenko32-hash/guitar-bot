@@ -369,7 +369,7 @@ async def fetch_html(url):
 
 
 async def import_from_mychords(url):
-    """Import a song from MyChords without touching Diez/manual import logic."""
+    """Import MyChords from the visible song text; do not depend on a.b-chord anchors."""
     html = await fetch_html(url)
     soup = BeautifulSoup(html, "html.parser")
 
@@ -382,42 +382,43 @@ async def import_from_mychords(url):
     if not song_div:
         raise ValueError("MyChords: не знайдено блок пісні w-words__text.")
 
-    # IMPORTANT: collect chord anchors BEFORE replacing them in the soup.
-    chords = []
-    for a in song_div.find_all("a", class_="b-chord"):
-        chord = normalize_mychords_chord_token(a.get_text(" ", strip=True))
-        if chord and CHORD_TOKEN_RE.fullmatch(chord):
-            chords.append(chord)
-
-    # Preserve visual line breaks.
+    # MyChords may render chords as ordinary text instead of <a class=b-chord>.
+    # Preserve line breaks, then parse chord prefixes directly from the visible text.
     for br in song_div.find_all("br"):
         br.replace_with("\n")
 
-    # Keep every chord as plain text with spaces around it, so it cannot glue to lyrics.
-    for a in song_div.find_all("a", class_="b-chord"):
-        chord = normalize_mychords_chord_token(a.get_text(" ", strip=True))
-        a.replace_with(f" {chord} ")
-
-    text = song_div.get_text()
+    text = song_div.get_text(" ", strip=False)
+    # get_text separator can add spaces around our explicit newlines; clean them only.
+    text = re.sub(r"[ \t]*\n[ \t]*", "\n", text)
     lyrics = normalize_mychords_import_text(text)
 
-    if not lyrics:
-        raise ValueError("MyChords: блок пісні порожній.")
+    if not lyrics or len(lyrics) < 40:
+        raise ValueError("MyChords: блок пісні порожній або неповний.")
 
-    # Fallback if the site changes the chord-anchor markup.
-    if len(chords) < 2:
-        chords = []
-        for line in lyrics.splitlines():
-            if is_chord_line(line):
-                chords.extend(_chords_from_line(line))
+    # Detect chords from the normalized text itself. This works whether MyChords
+    # used chord anchors or plain text such as 'Am Dm Темна нічка...'.
+    chords = []
+    for line in lyrics.splitlines():
+        if is_chord_line(line):
+            chords.extend(_chords_from_line(line))
 
     if len(chords) < 2:
-        raise ValueError("Не вдалося витягнути акорди з MyChords.")
+        raise ValueError("MyChords: у тексті пісні не знайдено достатньо акордів.")
+
+    # For an H1 containing only the title, use the category/artist breadcrumb when possible.
+    if artist == "Невідомий виконавець":
+        for a_tag in soup.find_all("a", href=True):
+            href = a_tag.get("href", "")
+            label = " ".join(a_tag.get_text(" ", strip=True).split())
+            if label and "/uk/" in href and label.lower() not in {"головна", "акорди"}:
+                if "ukrayinski-narodni" in href:
+                    artist = "Українські народні"
+                    break
 
     return {
         "title": title,
         "artist": artist,
-        "song_key": chords[0] if chords else detect_key_from_text(lyrics),
+        "song_key": chords[0],
         "lyrics": lyrics,
         "source_url": url.strip(),
         "source": "MyChords",

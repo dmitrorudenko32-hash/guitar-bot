@@ -375,6 +375,8 @@ async def import_from_mychords(url):
     if len(lyrics) < 80 or len(CHORD_RE.findall(lyrics)) < 2:
         raise ValueError("Не вдалося чисто витягнути акорди з MyChords.")
 
+    lyrics = clean_mychords_text(lyrics)
+
     return {
         "title": title,
         "artist": artist,
@@ -823,6 +825,109 @@ def _font(size, bold=False):
         if os.path.exists(p):
             return ImageFont.truetype(p, size)
     return ImageFont.load_default()
+
+def clean_mychords_text(text):
+    """Remove MyChords page chrome and keep the actual chord/lyric area."""
+    if not text:
+        return ""
+    lines = [x.strip() for x in str(text).replace("\r", "\n").splitlines()]
+    junk_exact = {
+        "акорди пісень", "вхід", "реєстрація", "випадкова пісня", "топ",
+        "топ виконавців", "топ пісень", "топ користувачів", "генератор акордів",
+        "налаштування гітари", "транспонувати акорди", "додати пісню",
+        "замовити пісню", "головна", "додати в пісенник", "видалити з пісенника",
+        "тональність:", "tahoma", "courier new", "roboto mono", "стоп", "/", "і"
+    }
+
+    # Best anchor: first chord-only line followed soon by a normal lyric line.
+    start = None
+    for i, line in enumerate(lines):
+        clean = line.strip("` ")
+        toks = [t.strip("|[](){}.,:;`") for t in clean.split() if t]
+        is_chords = bool(toks) and all(CHORD_TOKEN_RE.fullmatch(t) for t in toks)
+        if not is_chords:
+            continue
+        for j in range(i+1, min(i+4, len(lines))):
+            nxt = lines[j].strip("` ")
+            if not nxt:
+                continue
+            low = nxt.lower()
+            if low in junk_exact or low.startswith("в пісеннику у "):
+                continue
+            nt = [t.strip("|[](){}.,:;`") for t in nxt.split() if t]
+            if not (nt and all(CHORD_TOKEN_RE.fullmatch(t) for t in nt)):
+                start = i
+                break
+        if start is not None:
+            break
+
+    if start is None:
+        return text
+
+    kept = []
+    for line in lines[start:]:
+        low = line.lower().strip()
+        if low in {"коментарі", "схожі пісні", "інші пісні виконавця"}:
+            break
+        if low in junk_exact or low.startswith("в пісеннику у "):
+            continue
+        kept.append(line.strip("` "))
+    return "\n".join(kept).strip()
+
+
+def clean_easy_chords_text(text):
+    """Remove Telegram post metadata/notes when a real song block can be found."""
+    if not text:
+        return ""
+    lines = [x.strip() for x in str(text).replace("\r", "\n").splitlines()]
+
+    noise_prefixes = (
+        "🎬", "відео", "якщо важко грати", "якщо складно грати",
+        "тут", "трохи мого занудства", "трохи занудства",
+        "підписатися", "канал:", "джерело:"
+    )
+
+    # Find first chord row that is followed by lyric text.
+    start = None
+    for i, line in enumerate(lines):
+        clean = line.strip("` ")
+        toks = [t.strip("|[](){}.,:;`") for t in clean.split() if t]
+        if toks and all(CHORD_TOKEN_RE.fullmatch(t) for t in toks):
+            for j in range(i+1, min(i+4, len(lines))):
+                nxt = lines[j].strip()
+                if not nxt:
+                    continue
+                low = nxt.lower()
+                if any(low.startswith(p) for p in noise_prefixes):
+                    continue
+                nt = [t.strip("|[](){}.,:;`") for t in nxt.split() if t]
+                if not (nt and all(CHORD_TOKEN_RE.fullmatch(t) for t in nt)):
+                    start = i
+                    break
+        if start is not None:
+            break
+
+    # If no real chord+lyric block exists, do not mistake post notes for a song.
+    if start is None:
+        return ""
+
+    kept = []
+    for line in lines[start:]:
+        low = line.lower().strip()
+        if any(low.startswith(p) for p in noise_prefixes):
+            continue
+        kept.append(line.strip("` "))
+    return "\n".join(kept).strip()
+
+
+def normalize_imported_song_text(text, source_url=""):
+    url = (source_url or "").lower()
+    if "mychords" in url:
+        text = clean_mychords_text(text)
+    elif "t.me/easy_chords" in url or "easy_chords" in url:
+        text = clean_easy_chords_text(text)
+    return normalize_song_text(text)
+
 
 def normalize_song_text(text):
     """

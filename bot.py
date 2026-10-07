@@ -367,84 +367,63 @@ async def import_from_mychords(url):
 
     artist, title = split_artist_title(h1.get_text(" ", strip=True))
 
-    # v6.10: MyChords keeps the original chord in HTML attributes on some
-    # versions of its chord widgets. Restore it before extracting visible text,
-    # so a client-side transposed label cannot become the saved "original".
-    chord_attr_names = (
-        "data-original-chord", "data-original", "data-chord-original",
-        "data-chord", "data-name"
-    )
-    for tag in soup.find_all(True):
-        classes = " ".join(tag.get("class", [])).lower()
-        looks_like_chord = (
-            "chord" in classes
-            or tag.has_attr("data-chord")
-            or tag.has_attr("data-original-chord")
-            or tag.has_attr("data-chord-original")
-        )
-        if not looks_like_chord:
-            continue
-
-        original = None
-        for attr in chord_attr_names:
-            val = tag.get(attr)
-            if isinstance(val, str):
-                val = val.strip()
-                if CHORD_TOKEN_RE.fullmatch(val):
-                    original = val
-                    break
-        if original:
-            tag.clear()
-            tag.append(original)
-
-    # Extract ONLY the song zone. On MyChords the visible song starts after
-    # "Стоп" and ends before editing/video controls.
-    page_lines = [
+    # MyChords: беремо видимий текст 1:1 між "Стоп" та "Редагувати".
+    # Саме тут сайт віддає оригінальні акорди.
+    lines = [
         x.strip()
         for x in soup.get_text("\n", strip=True).replace("\r", "").splitlines()
         if x.strip()
     ]
 
-    start_i = None
-    for i, line in enumerate(page_lines):
-        if line.strip().lower() == "стоп":
-            start_i = i + 1
-            break
+    try:
+        start_i = next(i for i, x in enumerate(lines) if x.lower() == "стоп") + 1
+    except StopIteration:
+        raise ValueError("Не знайдено початок пісні (Стоп) на MyChords.")
 
-    if start_i is None:
-        # Fallback for pages where "Стоп" is absent.
-        for i, line in enumerate(page_lines):
-            clean = line.strip("` ")
-            toks = [t.strip("|[](){}.,:;`") for t in clean.split() if t]
-            if toks and all(CHORD_TOKEN_RE.fullmatch(t) for t in toks):
-                start_i = i
+    end_i = next(
+        (i for i in range(start_i, len(lines)) if lines[i].lower() == "редагувати"),
+        len(lines)
+    )
+    raw_song = lines[start_i:end_i]
+
+    # На MyChords рядок може виглядати:
+    # "Am G Em Не одна вже минула..."
+    # Розділяємо тільки початкову послідовність акордів від тексту.
+    output = []
+    for line in raw_song:
+        parts = line.split()
+        chords = []
+        pos = 0
+
+        for token in parts:
+            clean = token.strip("`|[](){}.,:;")
+            if CHORD_TOKEN_RE.fullmatch(clean):
+                chords.append(clean)
+                pos += 1
+            else:
                 break
 
-    if start_i is None:
-        raise ValueError("Не вдалося знайти початок пісні на MyChords.")
+        if chords and pos < len(parts):
+            lyric = " ".join(parts[pos:]).strip()
+            output.append(" ".join(chords))
+            if lyric:
+                output.append(lyric)
+        else:
+            output.append(line.strip("` "))
 
-    stop_words = {
-        "редагувати", "повідомити про помилку", "відео",
-        "коментарі", "останні коментарі"
-    }
-    song_lines = []
-    for line in page_lines[start_i:]:
-        low = line.lower().strip()
-        if low in stop_words or low.startswith("відео від "):
-            break
-        song_lines.append(line.strip("` "))
+    lyrics = normalize_song_text("\n".join(output))
 
-    lyrics = "\n".join(song_lines).strip()
-    lyrics = clean_mychords_text(lyrics)
-    lyrics = normalize_song_text(lyrics)
+    if not lyrics or len(CHORD_RE.findall(lyrics)) < 2:
+        raise ValueError("Не вдалося витягнути акорди з MyChords.")
 
-    if len(lyrics) < 30 or len(CHORD_RE.findall(lyrics)) < 2:
-        raise ValueError("Не вдалося чисто витягнути акорди з MyChords.")
+    # Перша гармонічна опора сторінки використовується як тональність,
+    # без будь-якого транспонування під час імпорту.
+    song_key = detect_key_from_text(lyrics)
 
     return {
         "title": title,
         "artist": artist,
-        "song_key": detect_key_from_text(lyrics),
+        "song_key": song_key,
         "lyrics": lyrics,
         "source_url": url.strip(),
         "source": "MyChords",

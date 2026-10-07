@@ -844,6 +844,10 @@ def _song_blocks(lyrics, semitones=0):
             if pending:
                 blocks.append(("chords", pending)); pending = []
             blocks.append(("section", sm.group(1).upper()))
+        elif _has_inline_chords(line):
+            if pending:
+                blocks.append(("chords", pending)); pending = []
+            blocks.append(("inline", _transpose_inline_line(line, semitones)))
         elif is_chord_line(line):
             pending.extend(_chords_from_line(line))
         elif pending:
@@ -858,9 +862,14 @@ def _unique_chords(lyrics, semitones=0):
     text = transpose_text(lyrics, semitones) if semitones else lyrics
     out = []
     for line in text.splitlines():
-        for c in _chords_from_line(line):
-            if c not in out:
-                out.append(c)
+        if _has_inline_chords(line):
+            for c in INLINE_CHORD_RE.findall(line):
+                if c not in out:
+                    out.append(c)
+        else:
+            for c in _chords_from_line(line):
+                if c not in out:
+                    out.append(c)
     return out
 
 # Six strings, low E -> high e. 0=open, -1=muted, positive=fret.
@@ -945,6 +954,65 @@ def _wrap_text(draw, text, font, max_width):
     lines.append(cur)
     return lines
 
+INLINE_CHORD_RE = re.compile(r"\[([A-G](?:#|b)?(?:m|maj|min|dim|aug|sus)?(?:2|4|5|6|7|9|11|13)?(?:add\d+)?(?:/[A-G](?:#|b)?)?)\]")
+
+def _has_inline_chords(line):
+    return bool(INLINE_CHORD_RE.search(line or ""))
+
+def _transpose_inline_line(line, semitones=0):
+    if not semitones:
+        return line
+    def repl(m):
+        return "[" + transpose_key(m.group(1), semitones) + "]"
+    return INLINE_CHORD_RE.sub(repl, line)
+
+def _inline_plain_and_anchors(line, semitones=0):
+    """Return clean lyric text and [(chord, character_offset), ...]."""
+    line = _transpose_inline_line(line, semitones)
+    plain_parts, anchors = [], []
+    pos = 0
+    for m in INLINE_CHORD_RE.finditer(line):
+        chunk = line[pos:m.start()]
+        plain_parts.append(chunk)
+        offset = len("".join(plain_parts))
+        anchors.append((m.group(1), offset))
+        pos = m.end()
+    plain_parts.append(line[pos:])
+    return "".join(plain_parts), anchors
+
+def _draw_inline_pair(draw, x, y, line, lyric_font, chord_font, body_w, ink, accent):
+    """Draw [Am]word style lyrics with exact chord anchors. Returns new y."""
+    plain, anchors = _inline_plain_and_anchors(line, 0)
+    # Keep exact anchors by wrapping at word boundaries while tracking source offsets.
+    words = list(re.finditer(r"\S+", plain))
+    if not words:
+        return y
+
+    rows = []
+    row_start = words[0].start()
+    row_end = words[0].end()
+    for wm in words[1:]:
+        candidate = plain[row_start:wm.end()]
+        if draw.textbbox((0,0), candidate, font=lyric_font)[2] <= body_w:
+            row_end = wm.end()
+        else:
+            rows.append((row_start, row_end))
+            row_start, row_end = wm.start(), wm.end()
+    rows.append((row_start, row_end))
+
+    for rs, re_ in rows:
+        row_text = plain[rs:re_]
+        row_anchors = [(c,o) for c,o in anchors if rs <= o <= re_]
+        for chord, off in row_anchors:
+            prefix = plain[rs:off]
+            px = draw.textbbox((0,0), prefix, font=lyric_font)[2] if prefix else 0
+            draw.text((x+px, y), chord, font=chord_font, fill=accent)
+        y += 35
+        draw.text((x,y),row_text,font=lyric_font,fill=ink)
+        y += 43
+    return y + 8
+
+
 def _wrap_chord_row(draw, chords, font, max_width, gap="   "):
     """Wrap a chord-only row without letting it run outside the poster."""
     rows, cur = [], []
@@ -989,6 +1057,10 @@ def render_song_images(song):
     for b in blocks:
         if b[0] == "section":
             body_h += 65
+        elif b[0] == "inline":
+            plain, _anchors = _inline_plain_and_anchors(b[1], 0)
+            wrapped = _wrap_text(pd, plain, lyric_font, body_w)
+            body_h += 78 * max(1, len(wrapped))
         elif b[0] == "pair":
             wrapped = _wrap_text(pd, b[2], lyric_font, body_w)
             body_h += 42 + 43*len(wrapped) + 10
@@ -1034,6 +1106,12 @@ def render_song_images(song):
             y += 38
             d.line((body_x,y,W-60,y),fill=rule,width=2)
             y += 20
+
+        elif kind=="inline":
+            y = _draw_inline_pair(
+                d, body_x, y, b[1], lyric_font, chord_font,
+                body_w, ink, accent
+            )
 
         elif kind=="pair":
             chord_list, lyric=b[1],b[2]

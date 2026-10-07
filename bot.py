@@ -1079,6 +1079,74 @@ def normalize_song_text(text):
     return "\n".join(result).strip()
 
 
+def normalize_manual_song_text(text):
+    """Clean text pasted manually from chord sites such as MyChords.
+
+    Converts rows like "Am E Ти признайся..." into a chord row followed by
+    the lyric row, normalizes section headings, and removes common site footer
+    text that is not part of the song.
+    """
+    if not text:
+        return ""
+
+    text = str(text).replace("\r\n", "\n").replace("\r", "\n")
+    text = text.replace("\u00a0", " ").replace("\u200b", "")
+
+    stop_markers = (
+        "все ще шукаєш правильні акорди",
+        "глянь 5 інших доступних варіантів",
+        "інші варіанти цієї пісні",
+        "другие варианты этой песни",
+    )
+    skip_prefixes = (
+        "автор песни —",
+        "автор пісні —",
+        "автор песни -",
+        "автор пісні -",
+    )
+
+    converted = []
+    for raw in text.splitlines():
+        line = re.sub(r"[ \t]+", " ", raw).strip()
+        low = line.lower()
+
+        if any(marker in low for marker in stop_markers):
+            break
+        if any(low.startswith(prefix) for prefix in skip_prefixes):
+            continue
+        if not line:
+            converted.append("")
+            continue
+
+        # MyChords copy/paste often produces: "Am E lyric words...".
+        # Peel off only consecutive chord tokens from the beginning. At least
+        # one non-chord token must remain, otherwise it is already a chord row.
+        parts = line.split()
+        chord_prefix = []
+        pos = 0
+        while pos < len(parts):
+            token = parts[pos].strip("|[](){}.,:;")
+            if CHORD_TOKEN_RE.fullmatch(token):
+                chord_prefix.append(token)
+                pos += 1
+            else:
+                break
+
+        if chord_prefix and pos < len(parts):
+            lyric = " ".join(parts[pos:]).strip()
+            # Avoid treating ordinary prose beginning with a single A-G word
+            # as a chord line; pasted song lines normally contain Cyrillic or
+            # multiple words after the chord prefix.
+            if lyric:
+                converted.append(" ".join(chord_prefix))
+                converted.append(lyric)
+                continue
+
+        converted.append(line)
+
+    return normalize_song_text("\n".join(converted))
+
+
 def _chords_from_line(line):
     out = []
     for token in re.split(r"\s+", line.strip()):
@@ -2447,7 +2515,7 @@ async def text_handler(message: Message):
                 data["title"],
                 data["artist"],
                 data["song_key"],
-                text
+                normalize_manual_song_text(text)
             ))
 
             song_id = cursor.fetchone()[0]

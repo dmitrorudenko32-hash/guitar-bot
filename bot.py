@@ -2,9 +2,11 @@ import os
 import psycopg
 import random
 import re
+import io
 from urllib.parse import urlparse
 from aiohttp import web, ClientSession, ClientTimeout
 from bs4 import BeautifulSoup
+from PIL import Image, ImageDraw, ImageFont
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart, Command
@@ -15,6 +17,7 @@ from aiogram.types import (
     InlineKeyboardButton,
     ReplyKeyboardMarkup,
     KeyboardButton,
+    BufferedInputFile,
 )
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
@@ -779,6 +782,12 @@ def song_card(song, semitones=None):
         ],
         [
             InlineKeyboardButton(
+                text="🖼 Зробити картинку",
+                callback_data=f"song_image_{song_id}"
+            )
+        ],
+        [
+            InlineKeyboardButton(
                 text="🗑 Видалити",
                 callback_data=f"delete_request_{song_id}"
             )
@@ -790,6 +799,192 @@ def song_card(song, semitones=None):
     ]
 
     return text, InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
+
+
+
+# ==================================================
+# КАРТИНКА ПІСНІ
+# ==================================================
+
+CHORD_TOKEN_RE = re.compile(
+    r"^[A-G](?:#|b)?(?:m|maj|min|dim|aug|sus)?"
+    r"(?:2|4|5|6|7|9|11|13)?(?:add\d+)?"
+    r"(?:/[A-G](?:#|b)?)?$",
+    re.I
+)
+
+def _font(size, bold=False):
+    candidates = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold
+        else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf" if bold
+        else "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+    ]
+    for p in candidates:
+        if os.path.exists(p):
+            return ImageFont.truetype(p, size)
+    return ImageFont.load_default()
+
+def _chords_from_line(line):
+    out = []
+    for token in re.split(r"\s+", line.strip()):
+        t = token.strip("|[](){}.,:;")
+        if CHORD_TOKEN_RE.fullmatch(t):
+            out.append(t)
+    return out
+
+def _song_blocks(lyrics, semitones=0):
+    """Turn stored lyrics into section/chord/text blocks for the poster."""
+    text = transpose_text(lyrics, semitones) if semitones else lyrics
+    blocks = []
+    pending_chords = []
+
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+
+        sm = SECTION_RE.match(line)
+        if sm:
+            if pending_chords:
+                blocks.append(("chords", pending_chords))
+                pending_chords = []
+            blocks.append(("section", sm.group(1).upper()))
+            continue
+
+        if is_chord_line(line):
+            pending_chords.extend(_chords_from_line(line))
+            continue
+
+        if pending_chords:
+            blocks.append(("pair", pending_chords, line))
+            pending_chords = []
+        else:
+            blocks.append(("text", line))
+
+    if pending_chords:
+        blocks.append(("chords", pending_chords))
+    return blocks
+
+def _unique_chords(lyrics, semitones=0):
+    text = transpose_text(lyrics, semitones) if semitones else lyrics
+    result = []
+    for line in text.splitlines():
+        for chord in _chords_from_line(line):
+            if chord not in result:
+                result.append(chord)
+    return result
+
+def render_song_image(song):
+    """Create a clean guitar-song PNG. Chords are highlighted above lyric lines."""
+    song_id, title, artist, song_key, lyrics, favorite, source_url, capo, saved_transpose = song
+    semitones = int(saved_transpose or 0)
+    shown_key = transpose_key(song_key, semitones) if song_key else "—"
+
+    W = 1400
+    margin = 70
+    left_w = 300
+    gap = 55
+    right_x = margin + left_w + gap
+    right_w = W - right_x - margin
+
+    title_font = _font(54, True)
+    meta_font = _font(25, False)
+    section_font = _font(25, True)
+    lyric_font = _font(31, False)
+    chord_font = _font(27, True)
+    chord_big = _font(34, True)
+
+    blocks = _song_blocks(lyrics, semitones)
+    chords = _unique_chords(lyrics, semitones)
+
+    # Estimate height first.
+    h = 220
+    for b in blocks:
+        if b[0] == "section":
+            h += 65
+        elif b[0] == "pair":
+            h += 88
+        else:
+            h += 50
+    h = max(1100, h + 120)
+
+    bg = (238, 249, 225)
+    ink = (37, 42, 38)
+    muted = (110, 116, 108)
+    accent = (205, 43, 43)
+    rule = (205, 218, 194)
+
+    img = Image.new("RGB", (W, h), bg)
+    d = ImageDraw.Draw(img)
+
+    # Header
+    title_box = d.textbbox((0, 0), title, font=title_font)
+    tw = title_box[2] - title_box[0]
+    d.text(((W - tw) / 2, 45), title, font=title_font, fill=ink)
+    meta = f"{artist}   •   Тональність: {shown_key}   •   Капо: {capo}"
+    mb = d.textbbox((0, 0), meta, font=meta_font)
+    d.text(((W - (mb[2]-mb[0]))/2, 115), meta, font=meta_font, fill=muted)
+    if semitones:
+        tr = f"Транспонування {semitones:+d}"
+        tb = d.textbbox((0, 0), tr, font=meta_font)
+        d.text(((W - (tb[2]-tb[0]))/2, 150), tr, font=meta_font, fill=accent)
+
+    # Left chord index (prototype: clear chord cards; diagrams can be added next)
+    d.text((margin, 220), "АКОРДИ", font=section_font, fill=muted)
+    cy = 275
+    for chord in chords[:16]:
+        d.rounded_rectangle((margin, cy, margin+230, cy+62), radius=15,
+                            outline=rule, width=2, fill=(245, 252, 237))
+        d.text((margin+22, cy+10), chord, font=chord_big, fill=accent)
+        cy += 78
+
+    # Song body
+    y = 220
+    for b in blocks:
+        kind = b[0]
+        if kind == "section":
+            y += 15
+            label = b[1]
+            d.text((right_x, y), label, font=section_font, fill=muted)
+            y += 38
+            d.line((right_x, y, W-margin, y), fill=rule, width=2)
+            y += 25
+
+        elif kind == "pair":
+            chord_list, lyric = b[1], b[2]
+            # Approximate positions evenly across the lyric width.
+            # This preserves a guitar-friendly "chords above words" layout
+            # even for old imports where Diez spacing was already lost.
+            lb = d.textbbox((0,0), lyric, font=lyric_font)
+            lyric_w = min(right_w, max(300, lb[2]-lb[0]))
+            n = len(chord_list)
+            for i, chord in enumerate(chord_list):
+                if n == 1:
+                    x = right_x
+                else:
+                    x = right_x + int(i * max(1, lyric_w-70) / (n-1))
+                d.text((x, y), chord, font=chord_font, fill=accent)
+            y += 34
+            d.text((right_x, y), lyric, font=lyric_font, fill=ink)
+            y += 54
+
+        elif kind == "chords":
+            line = "   ".join(b[1])
+            d.text((right_x, y), line, font=chord_font, fill=accent)
+            y += 50
+
+        else:
+            d.text((right_x, y), b[1], font=lyric_font, fill=ink)
+            y += 50
+
+    # Crop unused bottom space.
+    final_h = min(h, max(900, y + 80))
+    img = img.crop((0, 0, W, final_h))
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG", optimize=True)
+    return buf.getvalue()
 
 
 def songs_view(only_favorites=False):
@@ -1191,6 +1386,43 @@ async def bottom_favorites(message: Message):
         parse_mode="HTML",
         reply_markup=keyboard
     )
+
+
+
+@dp.callback_query(F.data.startswith("song_image_"))
+async def song_image(callback: CallbackQuery):
+    try:
+        song_id = int(callback.data.split("_")[-1])
+    except (ValueError, IndexError):
+        await safe_answer(callback)
+        return
+
+    cursor.execute("""
+        SELECT id, title, artist, song_key, lyrics, favorite, source_url, capo, transpose
+        FROM songs
+        WHERE id = %s
+    """, (song_id,))
+    song = cursor.fetchone()
+
+    if not song:
+        await callback.answer("Пісню не знайдено.", show_alert=True)
+        return
+
+    await callback.answer("🎨 Створюю картинку…")
+
+    try:
+        png = render_song_image(song)
+        filename = re.sub(r"[^0-9A-Za-zА-Яа-яІіЇїЄєҐґ_-]+", "_", song[1]).strip("_")
+        photo = BufferedInputFile(png, filename=f"{filename or 'song'}.png")
+        await callback.message.answer_photo(
+            photo=photo,
+            caption=f"🖼 <b>{escape_html(song[1])}</b> — картинка з акордами"
+        )
+    except Exception as e:
+        print("IMAGE ERROR:", repr(e))
+        await callback.message.answer(
+            "❌ Не вдалося створити картинку. Подивись Logs на Render."
+        )
 
 
 @dp.callback_query(F.data.startswith("favorite_"))

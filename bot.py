@@ -1,4 +1,5 @@
 import os
+import asyncio
 import psycopg
 import random
 import re
@@ -86,6 +87,8 @@ cursor = db.cursor()
 ADD_STATE = {}
 SEARCH_WAITING = set()
 TRANSPOSE_STATE = {}
+AUTO_SCROLL_STATE = {}
+AUTO_SCROLL_TASKS = {}
 
 
 # ==================================================
@@ -847,7 +850,11 @@ def song_card(song, semitones=None):
         ],
         [
             InlineKeyboardButton(
-                text="🖼 Зробити картинку",
+                text="▶️ Автоскрол",
+                callback_data=f"song_scroll_{song_id}"
+            ),
+            InlineKeyboardButton(
+                text="🖼 Картинка",
                 callback_data=f"song_image_{song_id}"
             )
         ],
@@ -1453,6 +1460,11 @@ def songs_view(only_favorites=False):
 
     keyboard = []
 
+    if not only_favorites and songs:
+        keyboard.append([
+            InlineKeyboardButton(text="🎤 За виконавцями", callback_data="artists")
+        ])
+
     for song_id, song_title, artist in songs:
         keyboard.append([
             InlineKeyboardButton(
@@ -1463,19 +1475,60 @@ def songs_view(only_favorites=False):
 
     if not only_favorites:
         keyboard.append([
-            InlineKeyboardButton(
-                text="➕ Додати пісню",
-                callback_data="add_song"
-            )
+            InlineKeyboardButton(text="➕ Додати пісню", callback_data="add_song")
         ])
 
     keyboard.append([
-        InlineKeyboardButton(
-            text="🏠 Головна",
-            callback_data="home"
-        )
+        InlineKeyboardButton(text="🏠 Головна", callback_data="home")
     ])
 
+    return text, InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+
+def artists_view():
+    cursor.execute("""
+        SELECT MIN(id), COALESCE(NULLIF(TRIM(artist), ''), 'Невідомий виконавець'), COUNT(*)
+        FROM songs
+        GROUP BY COALESCE(NULLIF(TRIM(artist), ''), 'Невідомий виконавець')
+        ORDER BY lower(COALESCE(NULLIF(TRIM(artist), ''), 'Невідомий виконавець'))
+    """)
+    artists = cursor.fetchall()
+
+    text = f"🎤 <b>Виконавці</b>\n\nВиконавців: <b>{len(artists)}</b>\n\nОбери виконавця 👇"
+    keyboard = []
+    for representative_id, artist, count in artists:
+        keyboard.append([
+            InlineKeyboardButton(
+                text=f"🎤 {artist} ({count})",
+                callback_data=f"artist_{representative_id}"
+            )
+        ])
+    keyboard.append([InlineKeyboardButton(text="⬅️ Усі пісні", callback_data="songs")])
+    keyboard.append([InlineKeyboardButton(text="🏠 Головна", callback_data="home")])
+    return text, InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+
+def artist_songs_view(representative_id):
+    cursor.execute("SELECT artist FROM songs WHERE id = %s", (representative_id,))
+    row = cursor.fetchone()
+    if not row:
+        return None, None
+    artist = row[0] or "Невідомий виконавець"
+    cursor.execute("""
+        SELECT id, title
+        FROM songs
+        WHERE COALESCE(artist, '') = %s
+        ORDER BY lower(title)
+    """, (row[0] or "",))
+    songs = cursor.fetchall()
+
+    text = f"🎤 <b>{escape_html(artist)}</b>\n\nПісень: <b>{len(songs)}</b>\n\nОбери пісню 👇"
+    keyboard = [
+        [InlineKeyboardButton(text=f"🎸 {title}", callback_data=f"song_{song_id}")]
+        for song_id, title in songs
+    ]
+    keyboard.append([InlineKeyboardButton(text="⬅️ До виконавців", callback_data="artists")])
+    keyboard.append([InlineKeyboardButton(text="🏠 Головна", callback_data="home")])
     return text, InlineKeyboardMarkup(inline_keyboard=keyboard)
 
 
@@ -1565,6 +1618,22 @@ async def bottom_songs(message: Message):
         parse_mode="HTML",
         reply_markup=keyboard
     )
+
+
+@dp.callback_query(F.data == "artists")
+async def show_artists(callback: CallbackQuery):
+    text, keyboard = artists_view()
+    await edit_screen(callback, text, keyboard)
+
+
+@dp.callback_query(F.data.regexp(r"^artist_\d+$"))
+async def show_artist_songs(callback: CallbackQuery):
+    representative_id = int(callback.data.replace("artist_", "", 1))
+    text, keyboard = artist_songs_view(representative_id)
+    if text is None:
+        await callback.answer("Виконавця не знайдено.", show_alert=True)
+        return
+    await edit_screen(callback, text, keyboard)
 
 
 @dp.callback_query(F.data.regexp(r"^song_\d+$"))
@@ -1822,6 +1891,168 @@ async def bottom_favorites(message: Message):
         reply_markup=keyboard
     )
 
+
+
+def autoscroll_keyboard(song_id, paused=False):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🐢 Повільніше", callback_data=f"scroll_slower_{song_id}"),
+            InlineKeyboardButton(
+                text="▶️ Продовжити" if paused else "⏸ Пауза",
+                callback_data=f"scroll_toggle_{song_id}"
+            ),
+            InlineKeyboardButton(text="🐇 Швидше", callback_data=f"scroll_faster_{song_id}"),
+        ],
+        [
+            InlineKeyboardButton(text="⏮ На початок", callback_data=f"scroll_restart_{song_id}"),
+            InlineKeyboardButton(text="⏹ Стоп", callback_data=f"scroll_stop_{song_id}"),
+        ]
+    ])
+
+
+def autoscroll_text(song, offset, speed, window=11):
+    song_id, title, artist, song_key, lyrics, favorite, source_url, capo, saved_transpose = song
+    semitones = int(saved_transpose or 0)
+    source = transpose_text(lyrics, semitones) if semitones else lyrics
+    lines = source.splitlines()
+    if not lines:
+        lines = ["(порожня пісня)"]
+    offset = max(0, min(offset, max(0, len(lines) - 1)))
+    shown = lines[offset:offset + window]
+    body = []
+    for raw in shown:
+        line = raw.strip()
+        if not line:
+            body.append("")
+        elif SECTION_RE.match(line):
+            body.append(f"<b>━━ {escape_html(line.upper())} ━━</b>")
+        elif is_chord_line(line):
+            body.append(f"<b><code>{escape_html(line)}</code></b>")
+        else:
+            body.append(escape_html(line))
+    progress = min(100, int((offset + 1) * 100 / max(1, len(lines))))
+    return (
+        f"▶️ <b>Автоскрол: {escape_html(title)}</b>\n"
+        f"👤 {escape_html(artist)}  •  ⚡ {speed:.1f} с  •  {progress}%\n\n"
+        + "\n".join(body)
+    ), len(lines)
+
+
+async def autoscroll_worker(user_id):
+    try:
+        while user_id in AUTO_SCROLL_STATE:
+            state = AUTO_SCROLL_STATE[user_id]
+            await asyncio.sleep(state["speed"])
+            state = AUTO_SCROLL_STATE.get(user_id)
+            if not state or state["paused"]:
+                continue
+
+            song = get_song(state["song_id"])
+            if not song:
+                break
+            text, total = autoscroll_text(song, state["offset"], state["speed"])
+            if state["offset"] >= max(0, total - 1):
+                state["paused"] = True
+                try:
+                    await state["message"].edit_text(
+                        text + "\n\n🏁 <b>Кінець пісні</b>",
+                        parse_mode="HTML",
+                        reply_markup=autoscroll_keyboard(state["song_id"], True)
+                    )
+                except TelegramBadRequest:
+                    pass
+                continue
+
+            state["offset"] += 1
+            text, _ = autoscroll_text(song, state["offset"], state["speed"])
+            try:
+                await state["message"].edit_text(
+                    text,
+                    parse_mode="HTML",
+                    reply_markup=autoscroll_keyboard(state["song_id"], False)
+                )
+            except TelegramBadRequest as e:
+                if "message is not modified" not in str(e):
+                    print("AUTOSCROLL EDIT ERROR:", repr(e))
+    except asyncio.CancelledError:
+        pass
+    finally:
+        AUTO_SCROLL_TASKS.pop(user_id, None)
+
+
+@dp.callback_query(F.data.startswith("song_scroll_"))
+async def start_autoscroll(callback: CallbackQuery):
+    song_id = int(callback.data.replace("song_scroll_", "", 1))
+    song = get_song(song_id)
+    if not song:
+        await callback.answer("Пісню не знайдено.", show_alert=True)
+        return
+
+    user_id = callback.from_user.id
+    old_task = AUTO_SCROLL_TASKS.pop(user_id, None)
+    if old_task:
+        old_task.cancel()
+
+    speed = 3.0
+    text, _ = autoscroll_text(song, 0, speed)
+    msg = await callback.message.answer(
+        text,
+        parse_mode="HTML",
+        reply_markup=autoscroll_keyboard(song_id, False)
+    )
+    AUTO_SCROLL_STATE[user_id] = {
+        "song_id": song_id, "offset": 0, "speed": speed,
+        "paused": False, "message": msg
+    }
+    AUTO_SCROLL_TASKS[user_id] = asyncio.create_task(autoscroll_worker(user_id))
+    await callback.answer("▶️ Автоскрол запущено")
+
+
+@dp.callback_query(F.data.regexp(r"^scroll_(toggle|faster|slower|restart|stop)_\d+$"))
+async def control_autoscroll(callback: CallbackQuery):
+    parts = callback.data.split("_")
+    action = parts[1]
+    song_id = int(parts[2])
+    user_id = callback.from_user.id
+    state = AUTO_SCROLL_STATE.get(user_id)
+
+    if not state or state["song_id"] != song_id:
+        await callback.answer("Автоскрол уже не активний.", show_alert=True)
+        return
+
+    if action == "stop":
+        task = AUTO_SCROLL_TASKS.pop(user_id, None)
+        if task:
+            task.cancel()
+        AUTO_SCROLL_STATE.pop(user_id, None)
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except TelegramBadRequest:
+            pass
+        await callback.answer("⏹ Автоскрол зупинено")
+        return
+    elif action == "toggle":
+        state["paused"] = not state["paused"]
+    elif action == "faster":
+        state["speed"] = max(1.5, round(state["speed"] - 0.5, 1))
+    elif action == "slower":
+        state["speed"] = min(8.0, round(state["speed"] + 0.5, 1))
+    elif action == "restart":
+        state["offset"] = 0
+        state["paused"] = False
+
+    song = get_song(song_id)
+    text, _ = autoscroll_text(song, state["offset"], state["speed"])
+    try:
+        await callback.message.edit_text(
+            text,
+            parse_mode="HTML",
+            reply_markup=autoscroll_keyboard(song_id, state["paused"])
+        )
+    except TelegramBadRequest as e:
+        if "message is not modified" not in str(e):
+            raise
+    await safe_answer(callback)
 
 
 @dp.callback_query(F.data.startswith("song_image_"))
@@ -2217,6 +2448,10 @@ async def on_startup(bot: Bot):
 
 
 async def on_shutdown(bot: Bot):
+    for task in list(AUTO_SCROLL_TASKS.values()):
+        task.cancel()
+    AUTO_SCROLL_TASKS.clear()
+    AUTO_SCROLL_STATE.clear()
     try:
         cursor.close()
         db.close()

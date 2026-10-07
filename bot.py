@@ -368,6 +368,25 @@ async def fetch_html(url):
             return await response.text()
 
 
+def mychords_debug_snapshot(html):
+    """Return a compact snapshot of what Render actually receives from MyChords."""
+    soup = BeautifulSoup(html, "html.parser")
+    song_div = soup.find("div", class_="w-words__text")
+    target = song_div if song_div else soup
+    anchors = target.select("a.b-chord") if target else []
+    chord_samples = [a.get_text(" ", strip=True) for a in anchors[:20]]
+    text = target.get_text("\n", strip=True) if target else ""
+    text = text.replace("\r", "")
+    preview = text[:3500]
+    return (
+        f"song_div={'YES' if song_div else 'NO'}\n"
+        f"b-chord count={len(anchors)}\n"
+        f"b-chord samples={chord_samples}\n"
+        f"HTML length={len(html)}\n"
+        f"TEXT PREVIEW:\n{preview}"
+    )
+
+
 async def import_from_mychords(url):
     """Import MyChords from the visible song text; do not depend on a.b-chord anchors."""
     html = await fetch_html(url)
@@ -403,7 +422,13 @@ async def import_from_mychords(url):
             chords.extend(_chords_from_line(line))
 
     if len(chords) < 2:
-        raise ValueError("MyChords: у тексті пісні не знайдено достатньо акордів.")
+        debug = mychords_debug_snapshot(html)
+        print("\n===== MYCHORDS DEBUG =====\n" + debug + "\n===== END MYCHORDS DEBUG =====\n", flush=True)
+        raise ValueError(
+            "MyChords: у тексті пісні не знайдено достатньо акордів.\n\n"
+            "🔧 Діагностику записано в Render Logs. "
+            "Відкрий Logs і надішли мені блок між MYCHORDS DEBUG та END MYCHORDS DEBUG."
+        )
 
     # For an H1 containing only the title, use the category/artist breadcrumb when possible.
     if artist == "Невідомий виконавець":

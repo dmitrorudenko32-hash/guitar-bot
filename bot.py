@@ -369,10 +369,7 @@ async def fetch_html(url):
 
 
 async def import_from_mychords(url):
-    """
-    MyChords parser based on the proven chords-fetcher approach:
-    use only div.w-words__text and explicit a.b-chord elements.
-    """
+    """Import a song from MyChords without touching Diez/manual import logic."""
     html = await fetch_html(url)
     soup = BeautifulSoup(html, "html.parser")
 
@@ -385,60 +382,34 @@ async def import_from_mychords(url):
     if not song_div:
         raise ValueError("MyChords: не знайдено блок пісні w-words__text.")
 
-    # Preserve visual line breaks from the song block.
+    # IMPORTANT: collect chord anchors BEFORE replacing them in the soup.
+    chords = []
+    for a in song_div.find_all("a", class_="b-chord"):
+        chord = normalize_mychords_chord_token(a.get_text(" ", strip=True))
+        if chord and CHORD_TOKEN_RE.fullmatch(chord):
+            chords.append(chord)
+
+    # Preserve visual line breaks.
     for br in song_div.find_all("br"):
         br.replace_with("\n")
 
-    # Mark chord anchors before extracting text so chords cannot merge into lyrics.
+    # Keep every chord as plain text with spaces around it, so it cannot glue to lyrics.
     for a in song_div.find_all("a", class_="b-chord"):
-        chord = a.get_text(" ", strip=True)
+        chord = normalize_mychords_chord_token(a.get_text(" ", strip=True))
         a.replace_with(f" {chord} ")
 
     text = song_div.get_text()
-
-    # Same idea as chords-fetcher: separate a chord if HTML glued it to a word.
-    text = re.sub(
-        r"([А-Яа-яІіЇїЄєA-Za-z])([A-G](?:#|b)?(?:m|maj|min|dim|aug|sus)?(?:2|4|5|6|7|9|11|13)?)",
-        r"\1 \2",
-        text
-    )
-    text = re.sub(
-        r"([A-G](?:#|b)?(?:m|maj|min|dim|aug|sus)?(?:2|4|5|6|7|9|11|13)?)([А-Яа-яІіЇїЄєA-Za-z])",
-        r"\1 \2",
-        text
-    )
-
-    # Clean whitespace but preserve line structure.
-    raw_lines = []
-    for raw in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
-        line = re.sub(r"[ \t]+", " ", raw).strip()
-        raw_lines.append(line)
-
-    while raw_lines and not raw_lines[0]:
-        raw_lines.pop(0)
-    while raw_lines and not raw_lines[-1]:
-        raw_lines.pop()
-
-    # Collapse excessive blank lines only.
-    cleaned = []
-    for line in raw_lines:
-        if line or not cleaned or cleaned[-1]:
-            cleaned.append(line)
-
-    lyrics = "\n".join(cleaned).strip()
+    lyrics = normalize_mychords_import_text(text)
 
     if not lyrics:
         raise ValueError("MyChords: блок пісні порожній.")
 
-    chords = []
-    for a in soup.select("div.w-words__text a.b-chord"):
-        chord = a.get_text(" ", strip=True)
-        if chord and CHORD_TOKEN_RE.fullmatch(chord):
-            chords.append(chord)
-
-    # Fallback in case MyChords changes anchors but text remains usable.
-    if not chords:
-        chords = CHORD_RE.findall(lyrics)
+    # Fallback if the site changes the chord-anchor markup.
+    if len(chords) < 2:
+        chords = []
+        for line in lyrics.splitlines():
+            if is_chord_line(line):
+                chords.extend(_chords_from_line(line))
 
     if len(chords) < 2:
         raise ValueError("Не вдалося витягнути акорди з MyChords.")
@@ -1123,6 +1094,77 @@ def normalize_song_text(text):
             continue
         result.append(line)
     return "\n".join(result).strip()
+
+
+def normalize_mychords_chord_token(token):
+    """Fix common MyChords chord typos/Unicode lookalikes without changing lyrics."""
+    token = str(token or "").strip().strip("|[](){}.,:;")
+    # Cyrillic lookalikes that sometimes appear in chord names on MyChords.
+    token = token.translate(str.maketrans({"А": "A", "В": "B", "С": "C", "Е": "E", "а": "a", "с": "c", "е": "e"}))
+    return token
+
+
+def normalize_mychords_import_text(text):
+    """Normalize only MyChords imports: chord prefixes, Cyrillic chord letters and footer noise."""
+    if not text:
+        return ""
+
+    text = str(text).replace("\r\n", "\n").replace("\r", "\n")
+    text = text.replace("\u00a0", " ").replace("\u200b", "")
+
+    stop_markers = (
+        "все ще шукаєш правильні акорди",
+        "глянь 5 інших доступних варіантів",
+        "інші варіанти цієї пісні",
+        "повідомити про помилку",
+        "відео від користувачів",
+        "коментарі",
+    )
+
+    out = []
+    for raw in text.splitlines():
+        line = re.sub(r"[ \t]+", " ", raw).strip()
+        if not line:
+            out.append("")
+            continue
+
+        low = line.lower()
+        if any(marker in low for marker in stop_markers):
+            break
+
+        # Repair punctuation/lookalikes token-by-token. This handles e.g. Аm -> Am, E. -> E.
+        parts = line.split()
+        fixed_parts = []
+        for p in parts:
+            core = p.strip("|[](){}.,:;")
+            fixed = normalize_mychords_chord_token(core)
+            if CHORD_TOKEN_RE.fullmatch(fixed):
+                # For chord tokens discard punctuation such as E. -> E.
+                fixed_parts.append(fixed)
+            else:
+                fixed_parts.append(p)
+        line = " ".join(fixed_parts)
+
+        # Split a leading run of chords from lyrics: "Am Dm Темна ніч..." -> two rows.
+        parts = line.split()
+        chord_prefix = []
+        pos = 0
+        while pos < len(parts):
+            tok = normalize_mychords_chord_token(parts[pos])
+            if CHORD_TOKEN_RE.fullmatch(tok):
+                chord_prefix.append(tok)
+                pos += 1
+            else:
+                break
+
+        if chord_prefix and pos < len(parts):
+            lyric = " ".join(parts[pos:]).strip()
+            out.append(" ".join(chord_prefix))
+            out.append(lyric)
+        else:
+            out.append(line)
+
+    return normalize_song_text(repair_glued_leading_chords("\n".join(out)))
 
 
 def normalize_manual_song_text(text):

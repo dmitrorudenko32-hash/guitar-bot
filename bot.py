@@ -367,21 +367,85 @@ async def import_from_mychords(url):
 
     artist, title = split_artist_title(h1.get_text(" ", strip=True))
 
-    # На MyChords потрібний текст зазвичай міститься в основній частині сторінки.
-    # Беремо текст сторінки, а потім обрізаємо його від першої музичної секції.
-    page_text = soup.get_text("\n", strip=True)
-    lyrics = trim_mychords_text(page_text)
+    # v6.10: MyChords keeps the original chord in HTML attributes on some
+    # versions of its chord widgets. Restore it before extracting visible text,
+    # so a client-side transposed label cannot become the saved "original".
+    chord_attr_names = (
+        "data-original-chord", "data-original", "data-chord-original",
+        "data-chord", "data-name"
+    )
+    for tag in soup.find_all(True):
+        classes = " ".join(tag.get("class", [])).lower()
+        looks_like_chord = (
+            "chord" in classes
+            or tag.has_attr("data-chord")
+            or tag.has_attr("data-original-chord")
+            or tag.has_attr("data-chord-original")
+        )
+        if not looks_like_chord:
+            continue
 
-    if len(lyrics) < 80 or len(CHORD_RE.findall(lyrics)) < 2:
-        raise ValueError("Не вдалося чисто витягнути акорди з MyChords.")
+        original = None
+        for attr in chord_attr_names:
+            val = tag.get(attr)
+            if isinstance(val, str):
+                val = val.strip()
+                if CHORD_TOKEN_RE.fullmatch(val):
+                    original = val
+                    break
+        if original:
+            tag.clear()
+            tag.append(original)
 
+    # Extract ONLY the song zone. On MyChords the visible song starts after
+    # "Стоп" and ends before editing/video controls.
+    page_lines = [
+        x.strip()
+        for x in soup.get_text("\n", strip=True).replace("\r", "").splitlines()
+        if x.strip()
+    ]
+
+    start_i = None
+    for i, line in enumerate(page_lines):
+        if line.strip().lower() == "стоп":
+            start_i = i + 1
+            break
+
+    if start_i is None:
+        # Fallback for pages where "Стоп" is absent.
+        for i, line in enumerate(page_lines):
+            clean = line.strip("` ")
+            toks = [t.strip("|[](){}.,:;`") for t in clean.split() if t]
+            if toks and all(CHORD_TOKEN_RE.fullmatch(t) for t in toks):
+                start_i = i
+                break
+
+    if start_i is None:
+        raise ValueError("Не вдалося знайти початок пісні на MyChords.")
+
+    stop_words = {
+        "редагувати", "повідомити про помилку", "відео",
+        "коментарі", "останні коментарі"
+    }
+    song_lines = []
+    for line in page_lines[start_i:]:
+        low = line.lower().strip()
+        if low in stop_words or low.startswith("відео від "):
+            break
+        song_lines.append(line.strip("` "))
+
+    lyrics = "\n".join(song_lines).strip()
     lyrics = clean_mychords_text(lyrics)
+    lyrics = normalize_song_text(lyrics)
+
+    if len(lyrics) < 30 or len(CHORD_RE.findall(lyrics)) < 2:
+        raise ValueError("Не вдалося чисто витягнути акорди з MyChords.")
 
     return {
         "title": title,
         "artist": artist,
         "song_key": detect_key_from_text(lyrics),
-        "lyrics": normalize_song_text(lyrics),
+        "lyrics": lyrics,
         "source_url": url.strip(),
         "source": "MyChords",
     }

@@ -453,6 +453,32 @@ async def import_from_mychords(url):
     }
 
 
+def normalize_diez_chord_rows(text):
+    """Group consecutive Diez chord-only lines into compact rows (max 4 chords)."""
+    if not text:
+        return ""
+    lines = str(text).replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    out = []
+    pending = []
+
+    def flush():
+        nonlocal pending
+        if pending:
+            for i in range(0, len(pending), 4):
+                out.append(" ".join(pending[i:i+4]))
+            pending = []
+
+    for raw in lines:
+        line = raw.strip()
+        if line and is_chord_line(line):
+            pending.extend(_chords_from_line(line))
+            continue
+        flush()
+        out.append(raw)
+    flush()
+    return "\n".join(out)
+
+
 async def import_from_diez(url):
     html = await fetch_html(url)
     soup = BeautifulSoup(html, "html.parser")
@@ -639,7 +665,7 @@ async def import_from_diez(url):
         "title": title,
         "artist": artist,
         "song_key": song_key,
-        "lyrics": normalize_song_text(lyrics),
+        "lyrics": normalize_song_text(normalize_diez_chord_rows(lyrics)),
         "source_url": url.strip(),
         "source": "Diez",
     }
@@ -1513,9 +1539,17 @@ def render_song_images(song):
     if final_h < H:
         img=img.crop((0,0,W,final_h))
 
-    buf=io.BytesIO()
-    img.save(buf,format="PNG",optimize=True)
-    return [buf.getvalue()]
+    # Telegram photos have dimension limits. Very long songs (especially imports)
+    # are split into several PNG pages instead of failing completely.
+    MAX_PAGE_H = 7600
+    pages = []
+    for top in range(0, img.height, MAX_PAGE_H):
+        bottom = min(top + MAX_PAGE_H, img.height)
+        page = img.crop((0, top, img.width, bottom))
+        buf = io.BytesIO()
+        page.save(buf, format="PNG", optimize=True)
+        pages.append(buf.getvalue())
+    return pages
 
 
 def songs_view(only_favorites=False):

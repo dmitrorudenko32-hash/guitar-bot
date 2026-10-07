@@ -1910,32 +1910,127 @@ def autoscroll_keyboard(song_id, paused=False):
     ])
 
 
-def autoscroll_text(song, offset, speed, window=11):
+def _scroll_pair_lines(chords, lyric):
+    """Place chord names above approximate word starts, like the song image."""
+    chords = list(chords or [])
+    lyric = (lyric or "").strip()
+    if not chords or not lyric:
+        return "   ".join(chords), lyric
+
+    words = list(re.finditer(r"\S+", lyric))
+    if not words:
+        return "   ".join(chords), lyric
+
+    # Same positioning idea as the image renderer: spread chords across
+    # distinct word starts. Monospace <pre> keeps the spaces in Telegram.
+    n = len(chords)
+    if n == 1:
+        positions = [0]
+    elif len(words) >= n:
+        idxs = []
+        for i in range(n):
+            idx = round(i * (len(words) - 1) / (n - 1))
+            if idxs and idx <= idxs[-1]:
+                idx = min(len(words) - 1, idxs[-1] + 1)
+            idxs.append(idx)
+        positions = [words[i].start() for i in idxs]
+    else:
+        width = max(len(lyric), n * 5)
+        positions = [round(i * max(1, width - 3) / (n - 1)) for i in range(n)]
+
+    row = []
+    cursor_pos = 0
+    for chord, pos in zip(chords, positions):
+        pos = max(pos, cursor_pos)
+        if pos > cursor_pos:
+            row.append(" " * (pos - cursor_pos))
+        row.append(chord)
+        cursor_pos = pos + len(chord)
+    return "".join(row).rstrip(), lyric
+
+
+def _autoscroll_rows(lyrics, semitones=0):
+    """Build visual rows so chords stay above the lyric they belong to."""
+    text = transpose_text(lyrics, semitones) if semitones else lyrics
+    src = text.splitlines()
+    rows = []
+    i = 0
+
+    while i < len(src):
+        line = src[i].strip()
+        if not line:
+            rows.append(("blank", ""))
+            i += 1
+            continue
+
+        sm = SECTION_RE.match(line)
+        if sm:
+            rows.append(("section", sm.group(1).upper()))
+            i += 1
+            continue
+
+        # A chord-only line followed by lyrics becomes a two-line visual pair.
+        if is_chord_line(line):
+            j = i + 1
+            while j < len(src) and not src[j].strip():
+                j += 1
+            if j < len(src):
+                nxt = src[j].strip()
+                if nxt and not SECTION_RE.match(nxt) and not is_chord_line(nxt):
+                    chord_row, lyric_row = _scroll_pair_lines(_chords_from_line(line), nxt)
+                    rows.append(("pair", chord_row, lyric_row))
+                    i = j + 1
+                    continue
+            rows.append(("chords", line))
+            i += 1
+            continue
+
+        rows.append(("text", line))
+        i += 1
+
+    # Remove repeated blank rows for a cleaner phone view.
+    cleaned = []
+    for row in rows:
+        if row[0] == "blank" and (not cleaned or cleaned[-1][0] == "blank"):
+            continue
+        cleaned.append(row)
+    return cleaned
+
+
+def autoscroll_text(song, offset, speed, window=7):
     song_id, title, artist, song_key, lyrics, favorite, source_url, capo, saved_transpose = song
     semitones = int(saved_transpose or 0)
-    source = transpose_text(lyrics, semitones) if semitones else lyrics
-    lines = source.splitlines()
-    if not lines:
-        lines = ["(порожня пісня)"]
-    offset = max(0, min(offset, max(0, len(lines) - 1)))
-    shown = lines[offset:offset + window]
+    rows = _autoscroll_rows(lyrics, semitones)
+    if not rows:
+        rows = [("text", "(порожня пісня)")]
+
+    offset = max(0, min(offset, max(0, len(rows) - 1)))
+    shown = rows[offset:offset + window]
     body = []
-    for raw in shown:
-        line = raw.strip()
-        if not line:
+
+    for row in shown:
+        kind = row[0]
+        if kind == "blank":
             body.append("")
-        elif SECTION_RE.match(line):
-            body.append(f"<b>━━ {escape_html(line.upper())} ━━</b>")
-        elif is_chord_line(line):
-            body.append(f"<b><code>{escape_html(line)}</code></b>")
+        elif kind == "section":
+            body.append(f"<b>━━ {escape_html(row[1])} ━━</b>")
+        elif kind == "pair":
+            # One PRE block is important: Telegram preserves every space,
+            # therefore each chord remains above the intended word.
+            body.append(
+                "<pre>" + escape_html(row[1]) + "\n" + escape_html(row[2]) + "</pre>"
+            )
+        elif kind == "chords":
+            body.append("<pre>" + escape_html(row[1]) + "</pre>")
         else:
-            body.append(escape_html(line))
-    progress = min(100, int((offset + 1) * 100 / max(1, len(lines))))
+            body.append(escape_html(row[1]))
+
+    progress = min(100, int((offset + 1) * 100 / max(1, len(rows))))
     return (
         f"▶️ <b>Автоскрол: {escape_html(title)}</b>\n"
         f"👤 {escape_html(artist)}  •  ⚡ {speed:.1f} с  •  {progress}%\n\n"
         + "\n".join(body)
-    ), len(lines)
+    ), len(rows)
 
 
 async def autoscroll_worker(user_id):

@@ -740,9 +740,29 @@ def is_chord_line(line):
     return musical == len(parts)
 
 
+def repair_glued_leading_chords(text):
+    """Split a leading chord accidentally glued to Cyrillic lyrics, e.g. GПролягла -> G\\nПролягла."""
+    if not text:
+        return text or ""
+
+    chord = r"[A-G](?:#|b)?(?:m|maj|min|dim|aug|sus)?(?:2|4|5|6|7|9|11|13)?(?:add\\d+)?(?:/[A-G](?:#|b)?)?"
+    rx = re.compile(rf"^({chord})(?=[А-Яа-яІіЇїЄєҐґ])")
+    fixed = []
+    for raw in str(text).splitlines():
+        line = raw.strip()
+        m = rx.match(line)
+        if m:
+            fixed.append(m.group(1))
+            fixed.append(line[m.end():].lstrip())
+        else:
+            fixed.append(raw)
+    return "\\n".join(fixed)
+
+
 def pretty_song_lyrics(lyrics, semitones=0):
     """Telegram-friendly view: section headers + bold monospace chords."""
-    source = transpose_text(lyrics, semitones) if semitones else lyrics
+    source = repair_glued_leading_chords(lyrics)
+    source = transpose_text(source, semitones) if semitones else source
     out = []
 
     icons = {
@@ -779,14 +799,8 @@ def pretty_song_lyrics(lyrics, semitones=0):
         if is_chord_line(line):
             # Telegram doesn't support arbitrary font colors.
             # Bold + monospace makes chords visually distinct.
-            # Add a tiny visual spacer after a chord row so the next lyric
-            # never looks glued to the final chord on small screens.
             out.append(f"<b><code>{escape_html(line)}</code></b>")
         else:
-            # If the previous rendered row was a chord row, insert a small
-            # blank line before the lyric for clearer separation.
-            if out and out[-1].startswith("<b><code>"):
-                out.append("")
             out.append(escape_html(line))
 
     # Avoid excessive empty lines.
@@ -1150,7 +1164,7 @@ def normalize_manual_song_text(text):
 
         converted.append(line)
 
-    return normalize_song_text("\n".join(converted))
+    return normalize_song_text(repair_glued_leading_chords("\n".join(converted)))
 
 
 def _chords_from_line(line):
@@ -1162,7 +1176,8 @@ def _chords_from_line(line):
     return out
 
 def _song_blocks(lyrics, semitones=0):
-    text = transpose_text(lyrics, semitones) if semitones else lyrics
+    text = repair_glued_leading_chords(lyrics)
+    text = transpose_text(text, semitones) if semitones else text
     blocks, pending = [], []
     for raw in text.splitlines():
         line = raw.strip()
@@ -2025,7 +2040,8 @@ def _scroll_pair_lines(chords, lyric):
 
 def _autoscroll_rows(lyrics, semitones=0):
     """Build visual rows so chords stay above the lyric they belong to."""
-    text = transpose_text(lyrics, semitones) if semitones else lyrics
+    text = repair_glued_leading_chords(lyrics)
+    text = transpose_text(text, semitones) if semitones else text
     src = text.splitlines()
     rows = []
     i = 0
@@ -2092,7 +2108,7 @@ def autoscroll_text(song, offset, speed, window=7):
             # One PRE block is important: Telegram preserves every space,
             # therefore each chord remains above the intended word.
             body.append(
-                "<pre>" + escape_html(row[1]) + "\n\n" + escape_html(row[2]) + "</pre>"
+                "<pre>" + escape_html(row[1]) + "\n" + escape_html(row[2]) + "</pre>"
             )
         elif kind == "chords":
             body.append("<pre>" + escape_html(row[1]) + "</pre>")

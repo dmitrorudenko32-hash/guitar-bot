@@ -364,11 +364,8 @@ async def import_from_mychords(url):
     h1 = soup.find("h1")
     if not h1:
         raise ValueError("Не вдалося знайти назву пісні на MyChords.")
-
     artist, title = split_artist_title(h1.get_text(" ", strip=True))
 
-    # MyChords: беремо видимий текст 1:1 між "Стоп" та "Редагувати".
-    # Саме тут сайт віддає оригінальні акорди.
     lines = [
         x.strip()
         for x in soup.get_text("\n", strip=True).replace("\r", "").splitlines()
@@ -378,52 +375,58 @@ async def import_from_mychords(url):
     try:
         start_i = next(i for i, x in enumerate(lines) if x.lower() == "стоп") + 1
     except StopIteration:
-        raise ValueError("Не знайдено початок пісні (Стоп) на MyChords.")
+        raise ValueError("Не знайдено «Стоп» на MyChords.")
 
     end_i = next(
         (i for i in range(start_i, len(lines)) if lines[i].lower() == "редагувати"),
         len(lines)
     )
+
     raw_song = lines[start_i:end_i]
 
-    # На MyChords рядок може виглядати:
-    # "Am G Em Не одна вже минула..."
-    # Розділяємо тільки початкову послідовність акордів від тексту.
+    # IMPORTANT: do NOT pass MyChords through the old chord normalizer here.
+    # Split each source line directly: leading chord tokens -> chord row + lyric row.
     output = []
+    first_chord = ""
+
     for line in raw_song:
         parts = line.split()
         chords = []
-        pos = 0
+        p = 0
 
-        for token in parts:
-            clean = token.strip("`|[](){}.,:;")
-            if CHORD_TOKEN_RE.fullmatch(clean):
-                chords.append(clean)
-                pos += 1
+        while p < len(parts):
+            token = parts[p].strip("`|[](){}.,:;")
+            if CHORD_TOKEN_RE.fullmatch(token):
+                chords.append(token)
+                if not first_chord:
+                    first_chord = token
+                p += 1
             else:
                 break
 
-        if chords and pos < len(parts):
-            lyric = " ".join(parts[pos:]).strip()
+        if chords:
             output.append(" ".join(chords))
+            lyric = " ".join(parts[p:]).strip()
             if lyric:
                 output.append(lyric)
         else:
-            output.append(line.strip("` "))
+            output.append(line.strip())
 
-    lyrics = normalize_song_text("\n".join(output))
+    # Only whitespace cleanup; preserve chords exactly as MyChords returned them.
+    cleaned = []
+    for line in output:
+        line = re.sub(r"[ \t]+", " ", line).strip()
+        if line or (cleaned and cleaned[-1] != ""):
+            cleaned.append(line)
+    lyrics = "\n".join(cleaned).strip()
 
     if not lyrics or len(CHORD_RE.findall(lyrics)) < 2:
         raise ValueError("Не вдалося витягнути акорди з MyChords.")
 
-    # Перша гармонічна опора сторінки використовується як тональність,
-    # без будь-якого транспонування під час імпорту.
-    song_key = detect_key_from_text(lyrics)
-
     return {
         "title": title,
         "artist": artist,
-        "song_key": song_key,
+        "song_key": first_chord or detect_key_from_text(lyrics),
         "lyrics": lyrics,
         "source_url": url.strip(),
         "source": "MyChords",

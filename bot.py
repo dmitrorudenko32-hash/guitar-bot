@@ -946,84 +946,117 @@ def _wrap_text(draw, text, font, max_width):
     return lines
 
 def render_song_images(song):
-    """Generate one or more phone-readable PNG pages."""
+    """v6.4 — one long, phone-readable song image."""
     song_id, title, artist, song_key, lyrics, favorite, source_url, capo, saved_transpose = song
     semitones = int(saved_transpose or 0)
     shown_key = transpose_key(song_key, semitones) if song_key else "—"
     blocks = _song_blocks(lyrics, semitones)
     chords = _unique_chords(lyrics, semitones)
 
-    W, H = 1200, 1600
-    bg=(238,249,225); ink=(35,39,35); muted=(105,112,102); accent=(214,43,35); rule=(202,217,191)
-    title_font=_font(48,True); meta_font=_font(22); section_font=_font(23,True)
-    lyric_font=_font(29,True); chord_font=_font(24,True)
+    W = 1200
+    bg=(238,249,225); ink=(35,39,35); muted=(105,112,102)
+    accent=(214,43,35); rule=(202,217,191)
 
-    # Split blocks into pages by estimated vertical cost.
-    pages, cur, used = [], [], 250
+    title_font=_font(54,True)
+    meta_font=_font(23)
+    section_font=_font(25,True)
+    lyric_font=_font(32,True)
+    chord_font=_font(27,True)
+
+    left_x = 55
+    body_x = 350
+    body_w = W - body_x - 60
+
+    # Estimate body height more accurately.
+    probe = Image.new("RGB",(W,500),bg)
+    pd = ImageDraw.Draw(probe)
+    body_h = 210
     for b in blocks:
-        cost = 60 if b[0]=="section" else (90 if b[0]=="pair" else 48)
-        if used + cost > H-90 and cur:
-            pages.append(cur); cur=[]; used=210
-        cur.append(b); used += cost
-    if cur: pages.append(cur)
+        if b[0] == "section":
+            body_h += 65
+        elif b[0] == "pair":
+            wrapped = _wrap_text(pd, b[2], lyric_font, body_w)
+            body_h += 42 + 43*len(wrapped) + 10
+        elif b[0] == "chords":
+            body_h += 48
+        else:
+            wrapped = _wrap_text(pd, b[1], lyric_font, body_w)
+            body_h += 43*len(wrapped) + 8
 
-    results=[]
-    for page_no, page_blocks in enumerate(pages, 1):
-        img=Image.new("RGB",(W,H),bg); d=ImageDraw.Draw(img)
-        # title
-        d.text((W/2,42), title, font=title_font, fill=ink, anchor="ma")
-        meta=f"{artist}  •  {shown_key}  •  капо {capo}"
-        if semitones: meta += f"  •  {semitones:+d}"
-        d.text((W/2,102),meta,font=meta_font,fill=muted,anchor="ma")
-        if len(pages)>1:
-            d.text((W-70,45),f"{page_no}/{len(pages)}",font=meta_font,fill=muted,anchor="ra")
-        d.line((55,145,W-55,145),fill=rule,width=2)
+    # Estimate chord diagram column.
+    diagram_h = 220 + min(len(chords), 14) * 190
+    H = max(1250, body_h + 90, diagram_h + 70)
 
-        left_x=55; body_x=310; body_w=W-body_x-60
-        # diagrams only on first page
-        if page_no==1:
-            d.text((left_x+60,170),"АКОРДИ",font=section_font,fill=muted,anchor="ma")
-            yy=215
-            for c in chords[:8]:
-                yy += _draw_chord_diagram(d,left_x,yy,c,ink,accent,muted)+8
-                if yy > H-170: break
+    img=Image.new("RGB",(W,H),bg)
+    d=ImageDraw.Draw(img)
 
-        y=175
-        for b in page_blocks:
-            kind=b[0]
-            if kind=="section":
-                y += 12
-                d.text((body_x,y),b[1],font=section_font,fill=muted)
-                y += 34
-                d.line((body_x,y,W-60,y),fill=rule,width=2)
-                y += 18
-            elif kind=="pair":
-                chord_list, lyric=b[1],b[2]
-                lines=_wrap_text(d,lyric,lyric_font,body_w)
-                # Chords distributed above the first lyric line because legacy Diez
-                # imports no longer contain exact character offsets.
-                lb=d.textbbox((0,0),lines[0],font=lyric_font)
-                lw=max(250,min(body_w,lb[2]-lb[0]))
-                n=len(chord_list)
-                for i,c in enumerate(chord_list):
-                    x=body_x if n==1 else body_x+int(i*max(1,lw-60)/(n-1))
-                    d.text((x,y),c,font=chord_font,fill=accent)
-                y += 30
-                for ln in lines:
-                    d.text((body_x,y),ln,font=lyric_font,fill=ink)
-                    y += 39
-                y += 12
-            elif kind=="chords":
-                d.text((body_x,y),"   ".join(b[1]),font=chord_font,fill=accent)
-                y += 46
-            else:
-                for ln in _wrap_text(d,b[1],lyric_font,body_w):
-                    d.text((body_x,y),ln,font=lyric_font,fill=ink); y+=39
-                y+=8
+    # Header
+    d.text((W/2,42), title, font=title_font, fill=ink, anchor="ma")
+    meta=f"{artist}  •  Тональність: {shown_key}  •  Капо: {capo}"
+    if semitones:
+        meta += f"  •  Транспонування {semitones:+d}"
+    d.text((W/2,110), meta, font=meta_font, fill=muted, anchor="ma")
+    d.line((55,155,W-55,155),fill=rule,width=2)
 
-        buf=io.BytesIO(); img.save(buf,format="PNG",optimize=True)
-        results.append(buf.getvalue())
-    return results
+    # Chord diagrams
+    d.text((left_x+100,180),"АКОРДИ",font=section_font,fill=muted,anchor="ma")
+    cy=225
+    for c in chords[:14]:
+        # Draw a larger version by temporarily using the existing diagram
+        # with extra vertical separation.
+        used = _draw_chord_diagram(d,left_x+30,cy,c,ink,accent,muted)
+        cy += max(180, used+22)
+
+    # Lyrics/chords
+    y=180
+    for b in blocks:
+        kind=b[0]
+
+        if kind=="section":
+            y += 10
+            d.text((body_x,y),b[1],font=section_font,fill=muted)
+            y += 38
+            d.line((body_x,y,W-60,y),fill=rule,width=2)
+            y += 20
+
+        elif kind=="pair":
+            chord_list, lyric=b[1],b[2]
+            lines=_wrap_text(d,lyric,lyric_font,body_w)
+
+            # For legacy imports exact character offsets are unavailable,
+            # so distribute the saved chords across the actual first-line width.
+            first = lines[0] if lines else lyric
+            box=d.textbbox((0,0),first,font=lyric_font)
+            lw=max(280,min(body_w,box[2]-box[0]))
+            n=len(chord_list)
+            for i,c in enumerate(chord_list):
+                x=body_x if n==1 else body_x+int(i*max(1,lw-70)/(n-1))
+                d.text((x,y),c,font=chord_font,fill=accent)
+
+            y += 35
+            for ln in lines:
+                d.text((body_x,y),ln,font=lyric_font,fill=ink)
+                y += 43
+            y += 10
+
+        elif kind=="chords":
+            d.text((body_x,y),"   ".join(b[1]),font=chord_font,fill=accent)
+            y += 48
+
+        else:
+            for ln in _wrap_text(d,b[1],lyric_font,body_w):
+                d.text((body_x,y),ln,font=lyric_font,fill=ink)
+                y += 43
+            y += 8
+
+    # Crop to actual used content while keeping diagrams visible.
+    final_h=max(y+70,cy+30,900)
+    if final_h < H:
+        img=img.crop((0,0,W,final_h))
+
+    buf=io.BytesIO()
+    img.save(buf,format="PNG",optimize=True)
+    return [buf.getvalue()]
 
 
 def songs_view(only_favorites=False):

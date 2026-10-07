@@ -435,14 +435,26 @@ async def import_from_diez(url):
         re.I
     )
 
-    first = None
-    for i, line in enumerate(lines):
-        if section_re.match(line):
-            first = i
-            break
-
-    if first is None:
+    section_indexes = [i for i, line in enumerate(lines) if section_re.match(line)]
+    if not section_indexes:
         raise ValueError("Не вдалося знайти початок пісні на Diez.")
+
+    # Diez often contains two renderings of the same song:
+    # 1) mobile/interactive, where one lyric line can be split into fragments;
+    # 2) compact text rendering, where the full lyric line stays together.
+    # For our poster the compact rendering is much better.
+    first = section_indexes[0]
+    rec_indexes = [
+        i for i, line in enumerate(lines)
+        if line.lower().startswith("рекомендований бій")
+    ]
+    if len(rec_indexes) >= 2:
+        after_second = [
+            i for i in section_indexes
+            if i > rec_indexes[1]
+        ]
+        if after_second:
+            first = after_second[0]
 
     song_lines = []
     for line in lines[first:]:
@@ -452,8 +464,7 @@ async def import_from_diez(url):
         # "Рекомендований бій", "для зручності: -3" і повтор пісні.
         # Для пісенника залишаємо лише перший основний варіант.
         if (
-            low.startswith("рекомендований бій")
-            or low.startswith("для зручності")
+            ((low.startswith("рекомендований бій") or low.startswith("для зручності")) and len(song_lines) > 6)
             or "можна грати на гітарі" in low
             or line == "Поскаржитись"
             or line == "Українські пісні, тексти й акорди для гри та співу."
@@ -1023,14 +1034,31 @@ def render_song_images(song):
             chord_list, lyric=b[1],b[2]
             lines=_wrap_text(d,lyric,lyric_font,body_w)
 
-            # For legacy imports exact character offsets are unavailable,
-            # so distribute the saved chords across the actual first-line width.
+            # Put chords on real word starts. Diez's compact representation
+            # preserves the full lyric line, so this looks much closer to a
+            # traditional guitar song sheet than equal pixel spacing.
             first = lines[0] if lines else lyric
-            box=d.textbbox((0,0),first,font=lyric_font)
-            lw=max(280,min(body_w,box[2]-box[0]))
-            n=len(chord_list)
+            word_matches = list(re.finditer(r"\\S+", first))
+            n = len(chord_list)
+
+            if not word_matches:
+                word_x = [body_x]
+            elif n <= 1:
+                word_x = [body_x]
+            else:
+                # Spread chord anchors across word starts, including first/last.
+                idxs = [
+                    round(i * (len(word_matches)-1) / (n-1))
+                    for i in range(n)
+                ]
+                word_x = []
+                for idx in idxs:
+                    prefix = first[:word_matches[idx].start()]
+                    px = d.textbbox((0,0), prefix, font=lyric_font)[2] if prefix else 0
+                    word_x.append(body_x + px)
+
             for i,c in enumerate(chord_list):
-                x=body_x if n==1 else body_x+int(i*max(1,lw-70)/(n-1))
+                x = word_x[min(i, len(word_x)-1)]
                 d.text((x,y),c,font=chord_font,fill=accent)
 
             y += 35

@@ -1132,7 +1132,7 @@ async def bottom_songs(message: Message):
     )
 
 
-@dp.callback_query(F.data.regexp(r"^song_\\d+$"))
+@dp.callback_query(F.data.regexp(r"^song_\d+$"))
 async def open_song(callback: CallbackQuery):
     song_id = int(callback.data.replace("song_", "", 1))
     song = get_song(song_id)

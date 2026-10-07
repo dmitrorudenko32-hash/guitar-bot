@@ -779,8 +779,14 @@ def pretty_song_lyrics(lyrics, semitones=0):
         if is_chord_line(line):
             # Telegram doesn't support arbitrary font colors.
             # Bold + monospace makes chords visually distinct.
+            # Add a tiny visual spacer after a chord row so the next lyric
+            # never looks glued to the final chord on small screens.
             out.append(f"<b><code>{escape_html(line)}</code></b>")
         else:
+            # If the previous rendered row was a chord row, insert a small
+            # blank line before the lyric for clearer separation.
+            if out and out[-1].startswith("<b><code>"):
+                out.append("")
             out.append(escape_html(line))
 
     # Avoid excessive empty lines.
@@ -2086,7 +2092,7 @@ def autoscroll_text(song, offset, speed, window=7):
             # One PRE block is important: Telegram preserves every space,
             # therefore each chord remains above the intended word.
             body.append(
-                "<pre>" + escape_html(row[1]) + "\n" + escape_html(row[2]) + "</pre>"
+                "<pre>" + escape_html(row[1]) + "\n\n" + escape_html(row[2]) + "</pre>"
             )
         elif kind == "chords":
             body.append("<pre>" + escape_html(row[1]) + "</pre>")

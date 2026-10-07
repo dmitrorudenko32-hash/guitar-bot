@@ -435,26 +435,14 @@ async def import_from_diez(url):
         re.I
     )
 
-    section_indexes = [i for i, line in enumerate(lines) if section_re.match(line)]
-    if not section_indexes:
-        raise ValueError("Не вдалося знайти початок пісні на Diez.")
+    first = None
+    for i, line in enumerate(lines):
+        if section_re.match(line):
+            first = i
+            break
 
-    # Diez often contains two renderings of the same song:
-    # 1) mobile/interactive, where one lyric line can be split into fragments;
-    # 2) compact text rendering, where the full lyric line stays together.
-    # For our poster the compact rendering is much better.
-    first = section_indexes[0]
-    rec_indexes = [
-        i for i, line in enumerate(lines)
-        if line.lower().startswith("рекомендований бій")
-    ]
-    if len(rec_indexes) >= 2:
-        after_second = [
-            i for i in section_indexes
-            if i > rec_indexes[1]
-        ]
-        if after_second:
-            first = after_second[0]
+    if first is None:
+        raise ValueError("Не вдалося знайти початок пісні на Diez.")
 
     song_lines = []
     for line in lines[first:]:
@@ -464,7 +452,8 @@ async def import_from_diez(url):
         # "Рекомендований бій", "для зручності: -3" і повтор пісні.
         # Для пісенника залишаємо лише перший основний варіант.
         if (
-            ((low.startswith("рекомендований бій") or low.startswith("для зручності")) and len(song_lines) > 6)
+            low.startswith("рекомендований бій")
+            or low.startswith("для зручності")
             or "можна грати на гітарі" in low
             or line == "Поскаржитись"
             or line == "Українські пісні, тексти й акорди для гри та співу."
@@ -956,6 +945,21 @@ def _wrap_text(draw, text, font, max_width):
     lines.append(cur)
     return lines
 
+def _wrap_chord_row(draw, chords, font, max_width, gap="   "):
+    """Wrap a chord-only row without letting it run outside the poster."""
+    rows, cur = [], []
+    for chord in chords:
+        test = gap.join(cur + [chord])
+        if cur and draw.textbbox((0, 0), test, font=font)[2] > max_width:
+            rows.append(cur)
+            cur = [chord]
+        else:
+            cur.append(chord)
+    if cur:
+        rows.append(cur)
+    return rows
+
+
 def render_song_images(song):
     """v6.4 — one long, phone-readable song image."""
     song_id, title, artist, song_key, lyrics, favorite, source_url, capo, saved_transpose = song
@@ -989,7 +993,8 @@ def render_song_images(song):
             wrapped = _wrap_text(pd, b[2], lyric_font, body_w)
             body_h += 42 + 43*len(wrapped) + 10
         elif b[0] == "chords":
-            body_h += 48
+            chord_rows = _wrap_chord_row(pd, b[1], chord_font, body_w)
+            body_h += 48 * max(1, len(chord_rows))
         else:
             wrapped = _wrap_text(pd, b[1], lyric_font, body_w)
             body_h += 43*len(wrapped) + 8
@@ -1034,31 +1039,34 @@ def render_song_images(song):
             chord_list, lyric=b[1],b[2]
             lines=_wrap_text(d,lyric,lyric_font,body_w)
 
-            # Put chords on real word starts. Diez's compact representation
-            # preserves the full lyric line, so this looks much closer to a
-            # traditional guitar song sheet than equal pixel spacing.
+            # v6.6: keep v6.4's stable layout, but snap chord positions to
+            # distinct word starts when possible. We do NOT pretend that the
+            # old Diez import contains exact character offsets — it doesn't.
             first = lines[0] if lines else lyric
-            word_matches = list(re.finditer(r"\\S+", first))
+            words = list(re.finditer(r"\S+", first))
             n = len(chord_list)
 
-            if not word_matches:
-                word_x = [body_x]
-            elif n <= 1:
-                word_x = [body_x]
-            else:
-                # Spread chord anchors across word starts, including first/last.
-                idxs = [
-                    round(i * (len(word_matches)-1) / (n-1))
-                    for i in range(n)
+            if n == 1 or len(words) < n:
+                box=d.textbbox((0,0),first,font=lyric_font)
+                lw=max(280,min(body_w,box[2]-box[0]))
+                xs=[body_x] if n == 1 else [
+                    body_x+int(i*max(1,lw-70)/(n-1)) for i in range(n)
                 ]
-                word_x = []
+            else:
+                # Select n distinct word starts across the line.
+                idxs=[]
+                for i in range(n):
+                    idx = round(i*(len(words)-1)/(n-1)) if n > 1 else 0
+                    if idxs and idx <= idxs[-1]:
+                        idx = min(len(words)-1, idxs[-1]+1)
+                    idxs.append(idx)
+                xs=[]
                 for idx in idxs:
-                    prefix = first[:word_matches[idx].start()]
-                    px = d.textbbox((0,0), prefix, font=lyric_font)[2] if prefix else 0
-                    word_x.append(body_x + px)
+                    prefix=first[:words[idx].start()]
+                    px=d.textbbox((0,0),prefix,font=lyric_font)[2] if prefix else 0
+                    xs.append(body_x+px)
 
-            for i,c in enumerate(chord_list):
-                x = word_x[min(i, len(word_x)-1)]
+            for x,c in zip(xs,chord_list):
                 d.text((x,y),c,font=chord_font,fill=accent)
 
             y += 35
@@ -1068,8 +1076,9 @@ def render_song_images(song):
             y += 10
 
         elif kind=="chords":
-            d.text((body_x,y),"   ".join(b[1]),font=chord_font,fill=accent)
-            y += 48
+            for chord_row in _wrap_chord_row(d, b[1], chord_font, body_w):
+                d.text((body_x,y),"   ".join(chord_row),font=chord_font,fill=accent)
+                y += 48
 
         else:
             for ln in _wrap_text(d,b[1],lyric_font,body_w):

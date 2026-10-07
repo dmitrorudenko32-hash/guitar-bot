@@ -992,7 +992,7 @@ async def transpose_song(callback: CallbackQuery):
     TRANSPOSE_STATE[song_id] = current
 
     cursor.execute(
-        "UPDATE songs SET transpose = ? WHERE id = %s",
+        "UPDATE songs SET transpose = %s WHERE id = %s",
         (current, song_id)
     )
 
@@ -1208,7 +1208,7 @@ async def toggle_favorite(callback: CallbackQuery):
     new_value = False if song[5] else True
 
     cursor.execute(
-        "UPDATE songs SET favorite = ? WHERE id = %s",
+        "UPDATE songs SET favorite = %s WHERE id = %s",
         (new_value, song_id)
     )
 

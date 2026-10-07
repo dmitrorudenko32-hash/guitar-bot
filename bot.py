@@ -366,34 +366,92 @@ async def fetch_html(url):
 
 
 async def import_from_mychords(url):
-    html = await fetch_html(url)
-    soup = BeautifulSoup(html, "html.parser")
+    """
+    MyChords can return a transposed variant to Render.
+    Fetch several harmless URL variants and choose the version whose
+    chord progression is the most plausible/original-looking one.
+    """
+    parsed = urlparse(url.strip())
+    base_url = f"{parsed.scheme or 'https'}://{parsed.netloc}{parsed.path}"
 
-    h1 = soup.find("h1")
-    if not h1:
-        raise ValueError("Не вдалося знайти назву пісні на MyChords.")
-    artist, title = split_artist_title(h1.get_text(" ", strip=True))
-
-    lines = [
-        x.strip()
-        for x in soup.get_text("\n", strip=True).replace("\r", "").splitlines()
-        if x.strip()
+    # Different query strings bypass MyChords/CDN cached session variants.
+    candidates_urls = [
+        base_url,
+        base_url + "?original=1",
+        base_url + "?t=0",
+        base_url + "?tone=0",
+        base_url + "?transpose=0",
     ]
 
-    try:
-        start_i = next(i for i, x in enumerate(lines) if x.lower() == "стоп") + 1
-    except StopIteration:
-        raise ValueError("Не знайдено «Стоп» на MyChords.")
+    variants = []
+    title = ""
+    artist = ""
 
-    end_i = next(
-        (i for i in range(start_i, len(lines)) if lines[i].lower() == "редагувати"),
-        len(lines)
-    )
+    for candidate_url in candidates_urls:
+        try:
+            html = await fetch_html(candidate_url)
+            soup = BeautifulSoup(html, "html.parser")
 
-    raw_song = lines[start_i:end_i]
+            h1 = soup.find("h1")
+            if h1 and not title:
+                artist, title = split_artist_title(h1.get_text(" ", strip=True))
 
-    # IMPORTANT: do NOT pass MyChords through the old chord normalizer here.
-    # Split each source line directly: leading chord tokens -> chord row + lyric row.
+            lines = [
+                x.strip()
+                for x in soup.get_text("\n", strip=True).replace("\r", "").splitlines()
+                if x.strip()
+            ]
+
+            start_i = next(i for i, x in enumerate(lines) if x.lower() == "стоп") + 1
+            end_i = next(
+                (i for i in range(start_i, len(lines)) if lines[i].lower() == "редагувати"),
+                len(lines)
+            )
+            raw = lines[start_i:end_i]
+            if raw:
+                variants.append(raw)
+        except Exception:
+            continue
+
+    if not variants:
+        raise ValueError("Не вдалося отримати текст пісні з MyChords.")
+
+    def chord_tokens(raw_lines):
+        found = []
+        for line in raw_lines:
+            for token in line.split():
+                token = token.strip("`|[](){}.,:;")
+                if CHORD_TOKEN_RE.fullmatch(token):
+                    found.append(token)
+        return found
+
+    def variant_score(raw_lines):
+        """
+        Prefer a musically coherent version and, on ties, the variant with
+        common open-position chords. This prevents the Render Fm/G cache
+        variant from winning over the site's Am/G/Em original.
+        """
+        chords = chord_tokens(raw_lines)
+        if not chords:
+            return -9999
+
+        open_common = {
+            "C","Cm","D","Dm","E","Em","F","Fm","G","Gm",
+            "A","Am","B","Bm","A7","B7","C7","D7","E7","G7"
+        }
+        score = sum(2 for c in chords if c in open_common)
+
+        # Reward a stable tonic recurrence.
+        first = chords[0]
+        score += chords.count(first) * 2
+
+        # MyChords original for many guitar arrangements tends to expose
+        # natural/open chords rather than an arbitrary server-side transposition.
+        score -= sum(1 for c in chords if "#" in c or "b" in c)
+        return score
+
+    raw_song = max(variants, key=variant_score)
+
     output = []
     first_chord = ""
 
@@ -420,25 +478,18 @@ async def import_from_mychords(url):
         else:
             output.append(line.strip())
 
-    # Only whitespace cleanup; preserve chords exactly as MyChords returned them.
-    cleaned = []
-    for line in output:
-        line = re.sub(r"[ \t]+", " ", line).strip()
-        if line or (cleaned and cleaned[-1] != ""):
-            cleaned.append(line)
-    lyrics = "\n".join(cleaned).strip()
+    lyrics = clean_song_text("\n".join(output))
 
     if not lyrics or len(CHORD_RE.findall(lyrics)) < 2:
         raise ValueError("Не вдалося витягнути акорди з MyChords.")
 
     return {
-        "title": title,
-        "artist": artist,
+        "title": title or "Без назви",
+        "artist": artist or "Невідомий виконавець",
         "song_key": first_chord or detect_key_from_text(lyrics),
         "lyrics": lyrics,
         "source_url": url.strip(),
         "source": "MyChords",
-        "debug_raw": "\n".join(raw_song[:20]),
     }
 
 
@@ -2025,13 +2076,6 @@ async def text_handler(message: Message):
             if len(imported["lyrics"]) > 900:
                 preview += "\n…"
 
-            debug_raw = imported.get("debug_raw", "")
-            debug_block = ""
-            if debug_raw:
-                debug_block = (
-                    "\n\n🧪 <b>RAW MyChords з Render:</b>\n"
-                    f"<pre>{escape_html(debug_raw[:700])}</pre>"
-                )
 
             keyboard = InlineKeyboardMarkup(
                 inline_keyboard=[
@@ -2057,7 +2101,7 @@ async def text_handler(message: Message):
                 f"👤 {escape_html(imported['artist'])}\n"
                 f"🎸 Тональність: <b>{escape_html(imported['song_key'] or 'не визначена')}</b>\n\n"
                 f"<pre>{escape_html(preview)}</pre>"
-                f"{debug_block}\n\n"
+                "\n\n"
                 "Якщо все виглядає правильно — натисни «✅ Зберегти».",
                 parse_mode="HTML",
                 reply_markup=keyboard

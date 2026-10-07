@@ -803,22 +803,21 @@ def song_card(song, semitones=None):
 
 
 # ==================================================
-# КАРТИНКА ПІСНІ
+# КАРТИНКА ПІСНІ — v6.3
 # ==================================================
 
 CHORD_TOKEN_RE = re.compile(
     r"^[A-G](?:#|b)?(?:m|maj|min|dim|aug|sus)?"
     r"(?:2|4|5|6|7|9|11|13)?(?:add\d+)?"
-    r"(?:/[A-G](?:#|b)?)?$",
-    re.I
+    r"(?:/[A-G](?:#|b)?)?$", re.I
 )
 
 def _font(size, bold=False):
     candidates = [
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold
-        else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf" if bold
-        else "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf" if bold else
+        "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
     ]
     for p in candidates:
         if os.path.exists(p):
@@ -834,157 +833,197 @@ def _chords_from_line(line):
     return out
 
 def _song_blocks(lyrics, semitones=0):
-    """Turn stored lyrics into section/chord/text blocks for the poster."""
     text = transpose_text(lyrics, semitones) if semitones else lyrics
-    blocks = []
-    pending_chords = []
-
+    blocks, pending = [], []
     for raw in text.splitlines():
         line = raw.strip()
         if not line:
             continue
-
         sm = SECTION_RE.match(line)
         if sm:
-            if pending_chords:
-                blocks.append(("chords", pending_chords))
-                pending_chords = []
+            if pending:
+                blocks.append(("chords", pending)); pending = []
             blocks.append(("section", sm.group(1).upper()))
-            continue
-
-        if is_chord_line(line):
-            pending_chords.extend(_chords_from_line(line))
-            continue
-
-        if pending_chords:
-            blocks.append(("pair", pending_chords, line))
-            pending_chords = []
+        elif is_chord_line(line):
+            pending.extend(_chords_from_line(line))
+        elif pending:
+            blocks.append(("pair", pending, line)); pending = []
         else:
             blocks.append(("text", line))
-
-    if pending_chords:
-        blocks.append(("chords", pending_chords))
+    if pending:
+        blocks.append(("chords", pending))
     return blocks
 
 def _unique_chords(lyrics, semitones=0):
     text = transpose_text(lyrics, semitones) if semitones else lyrics
-    result = []
+    out = []
     for line in text.splitlines():
-        for chord in _chords_from_line(line):
-            if chord not in result:
-                result.append(chord)
-    return result
+        for c in _chords_from_line(line):
+            if c not in out:
+                out.append(c)
+    return out
 
-def render_song_image(song):
-    """Create a clean guitar-song PNG. Chords are highlighted above lyric lines."""
+# Six strings, low E -> high e. 0=open, -1=muted, positive=fret.
+# Common open/barre shapes used by the songbook.
+CHORD_SHAPES = {
+    "C":  [-1,3,2,0,1,0], "Cm": [-1,3,5,5,4,3],
+    "C#": [-1,4,6,6,6,4], "C#m": [-1,4,6,6,5,4],
+    "Db": [-1,4,6,6,6,4], "Dbm": [-1,4,6,6,5,4],
+    "D":  [-1,-1,0,2,3,2], "Dm": [-1,-1,0,2,3,1],
+    "D#": [-1,6,8,8,8,6], "D#m": [-1,6,8,8,7,6],
+    "Eb": [-1,6,8,8,8,6], "Ebm": [-1,6,8,8,7,6],
+    "E":  [0,2,2,1,0,0], "Em": [0,2,2,0,0,0],
+    "F":  [1,3,3,2,1,1], "Fm": [1,3,3,1,1,1],
+    "F#": [2,4,4,3,2,2], "F#m": [2,4,4,2,2,2],
+    "Gb": [2,4,4,3,2,2], "Gbm": [2,4,4,2,2,2],
+    "G":  [3,2,0,0,0,3], "Gm": [3,5,5,3,3,3],
+    "G#": [4,6,6,5,4,4], "G#m": [4,6,6,4,4,4],
+    "Ab": [4,6,6,5,4,4], "Abm": [4,6,6,4,4,4],
+    "A":  [0,0,2,2,2,0], "Am": [0,0,2,2,1,0],
+    "A#": [-1,1,3,3,3,1], "A#m": [-1,1,3,3,2,1],
+    "Bb": [-1,1,3,3,3,1], "Bbm": [-1,1,3,3,2,1],
+    "B":  [-1,2,4,4,4,2], "Bm": [-1,2,4,4,3,2],
+}
+
+def _base_chord(chord):
+    # Diagram fallback: strip extensions but preserve major/minor root.
+    m = re.match(r"^([A-G](?:#|b)?)(m)?", chord)
+    return (m.group(1) + ("m" if m.group(2) else "")) if m else chord
+
+def _draw_chord_diagram(d, x, y, chord, ink, accent, muted):
+    name_font = _font(27, True)
+    small = _font(15, True)
+    shape = CHORD_SHAPES.get(_base_chord(chord))
+    d.text((x+58, y), chord, font=name_font, fill=ink, anchor="ma")
+    if not shape:
+        d.text((x+58, y+35), "схема —", font=small, fill=muted, anchor="ma")
+        return 75
+
+    positive = [f for f in shape if f > 0]
+    minf = min(positive) if positive else 1
+    maxf = max(positive) if positive else 1
+    start_fret = 1 if maxf <= 4 else minf
+    gx, gy = x+12, y+40
+    sw, fh = 20, 25
+
+    # fret number for shifted/barre positions
+    if start_fret > 1:
+        d.text((x-3, gy+2), str(start_fret), font=small, fill=muted)
+
+    # grid
+    for i in range(6):
+        xx = gx + i*sw
+        d.line((xx, gy, xx, gy+4*fh), fill=ink, width=2)
+    for j in range(5):
+        yy = gy + j*fh
+        d.line((gx, yy, gx+5*sw, yy), fill=ink, width=4 if (j==0 and start_fret==1) else 2)
+
+    for i, fret in enumerate(shape):
+        xx = gx + i*sw
+        if fret == 0:
+            d.ellipse((xx-5, gy-18, xx+5, gy-8), outline=ink, width=2)
+        elif fret < 0:
+            d.line((xx-5, gy-18, xx+5, gy-8), fill=muted, width=2)
+            d.line((xx+5, gy-18, xx-5, gy-8), fill=muted, width=2)
+        else:
+            rel = fret - start_fret + 1
+            if 1 <= rel <= 4:
+                yy = gy + (rel-.5)*fh
+                d.ellipse((xx-7, yy-7, xx+7, yy+7), fill=accent)
+    return 155
+
+def _wrap_text(draw, text, font, max_width):
+    words = text.split()
+    if not words: return [""]
+    lines, cur = [], words[0]
+    for w in words[1:]:
+        test = cur + " " + w
+        if draw.textbbox((0,0), test, font=font)[2] <= max_width:
+            cur = test
+        else:
+            lines.append(cur); cur = w
+    lines.append(cur)
+    return lines
+
+def render_song_images(song):
+    """Generate one or more phone-readable PNG pages."""
     song_id, title, artist, song_key, lyrics, favorite, source_url, capo, saved_transpose = song
     semitones = int(saved_transpose or 0)
     shown_key = transpose_key(song_key, semitones) if song_key else "—"
-
-    W = 1400
-    margin = 70
-    left_w = 300
-    gap = 55
-    right_x = margin + left_w + gap
-    right_w = W - right_x - margin
-
-    title_font = _font(54, True)
-    meta_font = _font(25, False)
-    section_font = _font(25, True)
-    lyric_font = _font(31, False)
-    chord_font = _font(27, True)
-    chord_big = _font(34, True)
-
     blocks = _song_blocks(lyrics, semitones)
     chords = _unique_chords(lyrics, semitones)
 
-    # Estimate height first.
-    h = 220
+    W, H = 1200, 1600
+    bg=(238,249,225); ink=(35,39,35); muted=(105,112,102); accent=(214,43,35); rule=(202,217,191)
+    title_font=_font(48,True); meta_font=_font(22); section_font=_font(23,True)
+    lyric_font=_font(29,True); chord_font=_font(24,True)
+
+    # Split blocks into pages by estimated vertical cost.
+    pages, cur, used = [], [], 250
     for b in blocks:
-        if b[0] == "section":
-            h += 65
-        elif b[0] == "pair":
-            h += 88
-        else:
-            h += 50
-    h = max(1100, h + 120)
+        cost = 60 if b[0]=="section" else (90 if b[0]=="pair" else 48)
+        if used + cost > H-90 and cur:
+            pages.append(cur); cur=[]; used=210
+        cur.append(b); used += cost
+    if cur: pages.append(cur)
 
-    bg = (238, 249, 225)
-    ink = (37, 42, 38)
-    muted = (110, 116, 108)
-    accent = (205, 43, 43)
-    rule = (205, 218, 194)
+    results=[]
+    for page_no, page_blocks in enumerate(pages, 1):
+        img=Image.new("RGB",(W,H),bg); d=ImageDraw.Draw(img)
+        # title
+        d.text((W/2,42), title, font=title_font, fill=ink, anchor="ma")
+        meta=f"{artist}  •  {shown_key}  •  капо {capo}"
+        if semitones: meta += f"  •  {semitones:+d}"
+        d.text((W/2,102),meta,font=meta_font,fill=muted,anchor="ma")
+        if len(pages)>1:
+            d.text((W-70,45),f"{page_no}/{len(pages)}",font=meta_font,fill=muted,anchor="ra")
+        d.line((55,145,W-55,145),fill=rule,width=2)
 
-    img = Image.new("RGB", (W, h), bg)
-    d = ImageDraw.Draw(img)
+        left_x=55; body_x=310; body_w=W-body_x-60
+        # diagrams only on first page
+        if page_no==1:
+            d.text((left_x+60,170),"АКОРДИ",font=section_font,fill=muted,anchor="ma")
+            yy=215
+            for c in chords[:8]:
+                yy += _draw_chord_diagram(d,left_x,yy,c,ink,accent,muted)+8
+                if yy > H-170: break
 
-    # Header
-    title_box = d.textbbox((0, 0), title, font=title_font)
-    tw = title_box[2] - title_box[0]
-    d.text(((W - tw) / 2, 45), title, font=title_font, fill=ink)
-    meta = f"{artist}   •   Тональність: {shown_key}   •   Капо: {capo}"
-    mb = d.textbbox((0, 0), meta, font=meta_font)
-    d.text(((W - (mb[2]-mb[0]))/2, 115), meta, font=meta_font, fill=muted)
-    if semitones:
-        tr = f"Транспонування {semitones:+d}"
-        tb = d.textbbox((0, 0), tr, font=meta_font)
-        d.text(((W - (tb[2]-tb[0]))/2, 150), tr, font=meta_font, fill=accent)
+        y=175
+        for b in page_blocks:
+            kind=b[0]
+            if kind=="section":
+                y += 12
+                d.text((body_x,y),b[1],font=section_font,fill=muted)
+                y += 34
+                d.line((body_x,y,W-60,y),fill=rule,width=2)
+                y += 18
+            elif kind=="pair":
+                chord_list, lyric=b[1],b[2]
+                lines=_wrap_text(d,lyric,lyric_font,body_w)
+                # Chords distributed above the first lyric line because legacy Diez
+                # imports no longer contain exact character offsets.
+                lb=d.textbbox((0,0),lines[0],font=lyric_font)
+                lw=max(250,min(body_w,lb[2]-lb[0]))
+                n=len(chord_list)
+                for i,c in enumerate(chord_list):
+                    x=body_x if n==1 else body_x+int(i*max(1,lw-60)/(n-1))
+                    d.text((x,y),c,font=chord_font,fill=accent)
+                y += 30
+                for ln in lines:
+                    d.text((body_x,y),ln,font=lyric_font,fill=ink)
+                    y += 39
+                y += 12
+            elif kind=="chords":
+                d.text((body_x,y),"   ".join(b[1]),font=chord_font,fill=accent)
+                y += 46
+            else:
+                for ln in _wrap_text(d,b[1],lyric_font,body_w):
+                    d.text((body_x,y),ln,font=lyric_font,fill=ink); y+=39
+                y+=8
 
-    # Left chord index (prototype: clear chord cards; diagrams can be added next)
-    d.text((margin, 220), "АКОРДИ", font=section_font, fill=muted)
-    cy = 275
-    for chord in chords[:16]:
-        d.rounded_rectangle((margin, cy, margin+230, cy+62), radius=15,
-                            outline=rule, width=2, fill=(245, 252, 237))
-        d.text((margin+22, cy+10), chord, font=chord_big, fill=accent)
-        cy += 78
-
-    # Song body
-    y = 220
-    for b in blocks:
-        kind = b[0]
-        if kind == "section":
-            y += 15
-            label = b[1]
-            d.text((right_x, y), label, font=section_font, fill=muted)
-            y += 38
-            d.line((right_x, y, W-margin, y), fill=rule, width=2)
-            y += 25
-
-        elif kind == "pair":
-            chord_list, lyric = b[1], b[2]
-            # Approximate positions evenly across the lyric width.
-            # This preserves a guitar-friendly "chords above words" layout
-            # even for old imports where Diez spacing was already lost.
-            lb = d.textbbox((0,0), lyric, font=lyric_font)
-            lyric_w = min(right_w, max(300, lb[2]-lb[0]))
-            n = len(chord_list)
-            for i, chord in enumerate(chord_list):
-                if n == 1:
-                    x = right_x
-                else:
-                    x = right_x + int(i * max(1, lyric_w-70) / (n-1))
-                d.text((x, y), chord, font=chord_font, fill=accent)
-            y += 34
-            d.text((right_x, y), lyric, font=lyric_font, fill=ink)
-            y += 54
-
-        elif kind == "chords":
-            line = "   ".join(b[1])
-            d.text((right_x, y), line, font=chord_font, fill=accent)
-            y += 50
-
-        else:
-            d.text((right_x, y), b[1], font=lyric_font, fill=ink)
-            y += 50
-
-    # Crop unused bottom space.
-    final_h = min(h, max(900, y + 80))
-    img = img.crop((0, 0, W, final_h))
-
-    buf = io.BytesIO()
-    img.save(buf, format="PNG", optimize=True)
-    return buf.getvalue()
+        buf=io.BytesIO(); img.save(buf,format="PNG",optimize=True)
+        results.append(buf.getvalue())
+    return results
 
 
 def songs_view(only_favorites=False):
@@ -1411,13 +1450,20 @@ async def song_image(callback: CallbackQuery):
     await callback.answer("🎨 Створюю картинку…")
 
     try:
-        png = render_song_image(song)
+        pages = render_song_images(song)
         filename = re.sub(r"[^0-9A-Za-zА-Яа-яІіЇїЄєҐґ_-]+", "_", song[1]).strip("_")
-        photo = BufferedInputFile(png, filename=f"{filename or 'song'}.png")
-        await callback.message.answer_photo(
-            photo=photo,
-            caption=f"🖼 <b>{escape_html(song[1])}</b> — картинка з акордами"
-        )
+        for i, png in enumerate(pages, 1):
+            suffix = f"_{i}" if len(pages) > 1 else ""
+            photo = BufferedInputFile(png, filename=f"{filename or 'song'}{suffix}.png")
+            caption = (
+                f"🖼 <b>{escape_html(song[1])}</b> — картинка з акордами"
+                + (f" • {i}/{len(pages)}" if len(pages) > 1 else "")
+            )
+            await callback.message.answer_photo(
+                photo=photo,
+                caption=caption,
+                parse_mode="HTML"
+            )
     except Exception as e:
         print("IMAGE ERROR:", repr(e))
         await callback.message.answer(

@@ -367,27 +367,38 @@ async def fetch_html(url):
 
 async def import_from_mychords(url):
     """
-    MyChords can return a transposed variant to Render.
-    Fetch several harmless URL variants and choose the version whose
-    chord progression is the most plausible/original-looking one.
+    MyChords has at least two stored/cached versions of some songs.
+    Render can receive an old version while the public/indexed page is newer.
+    To avoid the stale /uk edge, request the same song through all MyChords
+    language routes and select the majority version by its actual chord+lyric text.
     """
     parsed = urlparse(url.strip())
-    base_url = f"{parsed.scheme or 'https'}://{parsed.netloc}{parsed.path}"
+    parts = [p for p in parsed.path.split("/") if p]
 
-    # Different query strings bypass MyChords/CDN cached session variants.
-    candidates_urls = [
-        base_url,
-        base_url + "?original=1",
-        base_url + "?t=0",
-        base_url + "?tone=0",
-        base_url + "?transpose=0",
+    # Strip language prefix if present.
+    if parts and parts[0].lower() in {"uk", "ru", "en", "de"}:
+        song_parts = parts[1:]
+    else:
+        song_parts = parts
+
+    song_path = "/" + "/".join(song_parts)
+    host = parsed.netloc or "mychords.net"
+
+    # Current MyChords pages are mirrored across language routes.
+    # Web verification shows the corrected version of this song on /uk, /ru
+    # and the language-neutral route, so do not trust one Render edge response.
+    urls = [
+        f"https://{host}/uk{song_path}",
+        f"https://{host}/ru{song_path}",
+        f"https://{host}/en{song_path}",
+        f"https://{host}{song_path}",
     ]
 
     variants = []
     title = ""
     artist = ""
 
-    for candidate_url in candidates_urls:
+    for candidate_url in urls:
         try:
             html = await fetch_html(candidate_url)
             soup = BeautifulSoup(html, "html.parser")
@@ -402,66 +413,47 @@ async def import_from_mychords(url):
                 if x.strip()
             ]
 
-            start_i = next(i for i, x in enumerate(lines) if x.lower() == "стоп") + 1
+            start_i = next(i for i, x in enumerate(lines) if x.lower() in {"стоп", "stop"}) + 1
+
+            stop_words = {"редагувати", "редактировать", "edit"}
             end_i = next(
-                (i for i in range(start_i, len(lines)) if lines[i].lower() == "редагувати"),
+                (i for i in range(start_i, len(lines)) if lines[i].lower() in stop_words),
                 len(lines)
             )
+
             raw = lines[start_i:end_i]
             if raw:
-                variants.append(raw)
+                # Fingerprint the actual song body, not URL/query metadata.
+                fp = "\n".join(raw)
+                variants.append((candidate_url, raw, fp))
         except Exception:
             continue
 
     if not variants:
         raise ValueError("Не вдалося отримати текст пісні з MyChords.")
 
-    def chord_tokens(raw_lines):
-        found = []
-        for line in raw_lines:
-            for token in line.split():
-                token = token.strip("`|[](){}.,:;")
-                if CHORD_TOKEN_RE.fullmatch(token):
-                    found.append(token)
-        return found
+    # Group identical song bodies. Prefer the version returned by most language
+    # routes; this is safer than guessing a key or trying to 'transpose' stale data.
+    groups = {}
+    for candidate_url, raw, fp in variants:
+        groups.setdefault(fp, []).append((candidate_url, raw))
 
-    def variant_score(raw_lines):
-        """
-        Prefer a musically coherent version and, on ties, the variant with
-        common open-position chords. This prevents the Render Fm/G cache
-        variant from winning over the site's Am/G/Em original.
-        """
-        chords = chord_tokens(raw_lines)
-        if not chords:
-            return -9999
-
-        open_common = {
-            "C","Cm","D","Dm","E","Em","F","Fm","G","Gm",
-            "A","Am","B","Bm","A7","B7","C7","D7","E7","G7"
-        }
-        score = sum(2 for c in chords if c in open_common)
-
-        # Reward a stable tonic recurrence.
-        first = chords[0]
-        score += chords.count(first) * 2
-
-        # MyChords original for many guitar arrangements tends to expose
-        # natural/open chords rather than an arbitrary server-side transposition.
-        score -= sum(1 for c in chords if "#" in c or "b" in c)
-        return score
-
-    raw_song = max(variants, key=variant_score)
+    best_fp, best_group = max(
+        groups.items(),
+        key=lambda item: (len(item[1]), -urls.index(item[1][0][0]))
+    )
+    raw_song = best_group[0][1]
 
     output = []
     first_chord = ""
 
     for line in raw_song:
-        parts = line.split()
+        parts2 = line.split()
         chords = []
         p = 0
 
-        while p < len(parts):
-            token = parts[p].strip("`|[](){}.,:;")
+        while p < len(parts2):
+            token = parts2[p].strip("`|[](){}.,:;")
             if CHORD_TOKEN_RE.fullmatch(token):
                 chords.append(token)
                 if not first_chord:
@@ -472,7 +464,7 @@ async def import_from_mychords(url):
 
         if chords:
             output.append(" ".join(chords))
-            lyric = " ".join(parts[p:]).strip()
+            lyric = " ".join(parts2[p:]).strip()
             if lyric:
                 output.append(lyric)
         else:

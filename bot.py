@@ -756,7 +756,7 @@ def repair_glued_leading_chords(text):
             fixed.append(line[m.end():].lstrip())
         else:
             fixed.append(raw)
-    return "\\n".join(fixed)
+    return "\n".join(fixed)
 
 
 def pretty_song_lyrics(lyrics, semitones=0):

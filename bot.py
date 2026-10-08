@@ -369,65 +369,97 @@ async def fetch_html(url):
 
 
 def mychords_dom_lines(song_div):
-    """Extract visual song lines, respecting HTML <br> and block boundaries.
+    """Read MyChords by chord/lyric fragments, not by flattened HTML text.
 
-    Unlike stripped_strings, this does not erase line boundaries or join
-    consecutive chords from unrelated lines.
+    Chord spans inside lyric lines become a chord row followed by the lyrics.
+    A new chord after lyrics begins a new musical line, even without <br>.
     """
     from bs4 import NavigableString, Tag
 
-    rows = []
-    current = []
+    rows, chords, words = [], [], []
     block_tags = {"div", "p", "section", "article", "pre", "li"}
-    chord_classes = {"chord", "chords", "w-words__chord", "w-words__chords"}
+    chord_re = re.compile(
+        r"[A-G](?:#|b)?(?:maj|min|dim|aug|sus|m)?"
+        r"(?:2|4|5|6|7|9|11|13)?(?:add\d+)?(?:/[A-G](?:#|b)?)?"
+    )
+    # Match only at the start of a fragment, including a chord glued to a
+    # Cyrillic word by HTML: 'CmНахилився'. Never parse within normal prose.
+    glued_re = re.compile(
+        r"^\s*((?:[A-G](?:#|b)?(?:maj|min|dim|aug|sus|m)?"
+        r"(?:2|4|5|6|7|9|11|13)?(?:add\d+)?(?:/[A-G](?:#|b)?)?"
+        r"[ \t]*)+)(?=[А-Яа-яІіЇїЄєҐґ])"
+    )
 
     def flush():
-        if not current:
-            return
-        raw = "".join(current).replace("\xa0", " ").replace("\u200b", "")
-        current.clear()
-        value = re.sub(r"[ \t]+", " ", raw).strip()
-        if value:
-            rows.append(value)
-        elif rows and rows[-1] != "":
-            rows.append("")
+        if chords:
+            rows.append(" ".join(chords))
+            chords.clear()
+        if words:
+            lyric = re.sub(r"[ \t]+", " ", "".join(words)).strip()
+            if lyric:
+                rows.append(lyric)
+            words.clear()
 
-    def append_text(value):
-        value = str(value).replace("\r\n", "\n").replace("\r", "\n")
-        parts = value.split("\n")
-        for i, part in enumerate(parts):
+    def add_chord(value):
+        tokens = [normalize_mychords_chord_token(t) for t in value.split()]
+        if not tokens or not all(CHORD_TOKEN_RE.fullmatch(t) for t in tokens):
+            add_text(value)
+            return
+        if words and "".join(words).strip():
+            flush()
+        chords.extend(tokens)
+
+    def add_text(value):
+        value = str(value).replace("\xa0", " ").replace("\u200b", "")
+        value = value.replace("\r\n", "\n").replace("\r", "\n")
+        for i, fragment in enumerate(value.split("\n")):
             if i:
                 flush()
-            current.append(part)
+            if not fragment.strip():
+                words.append(fragment)
+                continue
+            # Some MyChords templates place chord tokens directly before
+            # Cyrillic text, with no intervening whitespace or span marker.
+            m = glued_re.match(fragment)
+            if m:
+                prefix = m.group(1)
+                tokens = [normalize_mychords_chord_token(t) for t in prefix.split()]
+                if tokens and all(CHORD_TOKEN_RE.fullmatch(t) for t in tokens):
+                    add_chord(" ".join(tokens))
+                    fragment = fragment[m.end():]
+            # Standalone chord text nodes can be recognized without changing
+            # ordinary Ukrainian words such as 'А' or 'В'.
+            stripped = fragment.strip()
+            if stripped and is_mychords_chord_only(stripped) and (
+                len(stripped) > 1 or stripped not in {"А", "В", "A", "B"}
+            ):
+                add_chord(stripped)
+            else:
+                words.append(fragment)
 
     def walk(node):
         if isinstance(node, NavigableString):
-            append_text(node)
+            add_text(node)
             return
         if not isinstance(node, Tag):
             return
-        name = node.name.lower() if node.name else ""
+        name = (node.name or "").lower()
         if name in {"script", "style", "svg", "button"}:
             return
         if name == "br":
             flush()
             return
+        classes = " ".join(node.get("class", [])).lower()
+        is_chord = (node.get("data-chord") is not None or
+                    "chord" in classes or "akkord" in classes)
+        if is_chord and name in {"span", "b", "strong", "a", "i", "sup"}:
+            add_chord(node.get("data-chord") or node.get_text(" ", strip=True))
+            return
         is_block = name in block_tags and node is not song_div
         if is_block:
             flush()
-        classes = set(node.get("class", []))
-        is_chord = bool(classes & chord_classes) or (name in {"span", "b", "strong", "a"} and
-                     (node.get("data-chord") is not None or "chord" in " ".join(classes).lower()))
-        if is_chord:
-            token = node.get_text(" ", strip=True)
-            if token:
-                if current and current[-1] and not current[-1].endswith((" ", "\t")):
-                    current.append(" ")
-                current.append(token)
-                current.append(" ")
-        else:
-            for child in node.children:
-                walk(child)
+        for child in node.children:
+            walk(child)
         if is_block:
             flush()
 
@@ -480,9 +512,9 @@ async def import_from_mychords(url):
         if is_mychords_chord_only(part):
             lines.append(" ".join(normalize_mychords_chord_token(w) for w in part.split()))
             continue
-        normalized = normalize_mychords_import_text(part)
-        if normalized:
-            lines.extend(normalized.splitlines())
+        # DOM parser already separated chord nodes from lyric fragments.
+        # Do not re-interpret ordinary lyric words as chord symbols.
+        lines.append(part)
 
     lyrics = normalize_song_text("\n".join(lines))
     chords = [c for row in lyrics.splitlines() if is_chord_line(row)

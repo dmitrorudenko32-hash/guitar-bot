@@ -2129,17 +2129,67 @@ async def add_by_url(callback: CallbackQuery):
 # ==================================================
 
 def ocr_screenshot(data: bytes) -> str:
+    """Free Tesseract OCR with chord-row repair and approximate horizontal layout."""
     import pytesseract
+    from pytesseract import Output
     from PIL import ImageOps, ImageEnhance, ImageFilter
+
+    def chord_token(value):
+        # Fix OCR lookalikes ONLY on rows that consist entirely of chords.
+        value = value.strip().strip("|,;:")
+        value = value.translate(str.maketrans({"А": "A", "В": "B", "С": "C", "Е": "E", "Н": "H", "а": "a", "с": "c", "е": "e", "т": "m", "Т": "m"}))
+        value = value.replace("М", "m").replace("М7", "m7")
+        value = value.replace("Мm", "m")
+        if value in {"At", "AT", "Amn", "Arn", "Ат"}:
+            value = "Am"
+        if value in {"Ет", "Emn", "Ern"}:
+            value = "Em"
+        if value in {"От", "Dmн"}:
+            value = "Dm"
+        value = value.replace("FM7", "Fmaj7") if value == "FM7" else value
+        return value if re.fullmatch(r"[A-G](?:#|b)?(?:m|maj|min|sus|dim|aug)?(?:2|4|5|6|7|9|11|13)?(?:/[A-G](?:#|b)?)?", value) else None
+
+    def process(img):
+        if img.width < 1400:
+            factor = min(3.0, 1400 / max(1, img.width))
+            img = img.resize((round(img.width * factor), round(img.height * factor)))
+        gray = ImageOps.grayscale(img)
+        gray = ImageEnhance.Contrast(gray).enhance(1.7)
+        gray = gray.filter(ImageFilter.SHARPEN)
+        result = pytesseract.image_to_data(gray, lang="ukr+eng", config="--psm 6", output_type=Output.DICT)
+        lines = {}
+        for i, word in enumerate(result["text"]):
+            word = word.strip()
+            if not word:
+                continue
+            key = (result["block_num"][i], result["par_num"][i], result["line_num"][i])
+            lines.setdefault(key, []).append((result["left"][i], result["width"][i], word))
+        output = []
+        for words in lines.values():
+            words.sort(key=lambda x: x[0])
+            tokens = [w for _, _, w in words]
+            corrected = [chord_token(w) for w in tokens]
+            # A lyric line can contain single-letter words; require chord-like
+            # evidence before treating it as a chord row.
+            chord_row = all(corrected) and (len(tokens) > 1 or any(re.search(r"[m#b7]", t) for t in corrected))
+            if chord_row:
+                tokens = corrected
+            # Preserve horizontal offsets, useful when chords sit above words.
+            avg_char_px = max(9, sum(width for x, width, word in words) / max(1, sum(len(w) for w in tokens)))
+            line = ""
+            for (left, _, _), token in zip(words, tokens):
+                target = min(110, round(left / avg_char_px))
+                line += " " * max(1 if line else 0, target - len(line)) + token
+            output.append(line.rstrip())
+        return "\n".join(output).strip()
+
     with Image.open(io.BytesIO(data)) as original:
         image = ImageOps.exif_transpose(original).convert("RGB")
-        if image.width < 1200:
-            scale = min(3, 1200 / max(image.width, 1))
-            image = image.resize((int(image.width * scale), int(image.height * scale)))
-        gray = ImageOps.grayscale(image)
-        gray = ImageEnhance.Contrast(gray).enhance(1.5)
-        gray = gray.filter(ImageFilter.SHARPEN)
-        return pytesseract.image_to_string(gray, lang="ukr+eng", config="--psm 6")
+        text = process(image)
+        if len(text) < 12:
+            # Fallback for screenshots where line segmentation fails.
+            text = pytesseract.image_to_string(image, lang="ukr+eng", config="--psm 6")
+        return text
 
 
 def screenshot_keyboard():

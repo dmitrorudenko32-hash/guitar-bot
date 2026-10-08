@@ -516,6 +516,9 @@ async def import_from_mychords(url):
             continue
         # DOM parser already separated chord nodes from lyric fragments.
         # Do not re-interpret ordinary lyric words as chord symbols.
+        part = re.sub(r"^,\s*", "", part)
+        part = re.sub(r"\s+([,.;:!?])", r"\1", part)
+        part = re.sub(r"([,;:!?])(?=[А-Яа-яІіЇїЄєҐґ])", r"\1 ", part)
         lines.append(part)
 
     lyrics = normalize_song_text("\n".join(lines))
@@ -530,17 +533,30 @@ async def import_from_mychords(url):
     expected_key = expected.group(1).replace("-sharp", "#").replace("-flat", "b").upper() if expected else ""
     if expected_key.endswith("M"):
         expected_key = expected_key[:-1] + "m"
+    # A key in the URL is a hint, not a guarantee of the harmony.
+    # Only transpose when the first chord has the same major/minor quality.
+    auto_shift = 0
+    if expected_key and chords[0].lower() != expected_key.lower():
+        src_match = re.fullmatch(r"([A-G](?:#|b)?)(m?)", chords[0])
+        dst_match = re.fullmatch(r"([A-G](?:#|b)?)(m?)", expected_key)
+        if src_match and dst_match and src_match.group(2) == dst_match.group(2):
+            src_note = NOTE_TO_INDEX.get(src_match.group(1))
+            dst_note = NOTE_TO_INDEX.get(dst_match.group(1))
+            if src_note is not None and dst_note is not None:
+                auto_shift = (dst_note - src_note + 6) % 12 - 6
     source_warning = ""
     if expected_key and chords[0].lower() != expected_key.lower():
         source_warning = (
             f"⚠️ MyChords повернув акорди від {chords[0]}, "
             f"хоча адреса сторінки вказує {expected_key}. "
-            "Перевір акорди перед збереженням: транспонування не завжди виправляє іншу версію гармонії."
+            + (f"Попередньо встановлено транспонування {auto_shift:+d}. " if auto_shift else "Автоматичне транспонування не застосовано. ")
+            + "Перевір акорди перед збереженням: зміна тональності не гарантує збігу гармонії."
         )
     return {
         "title": title, "artist": artist, "song_key": chords[0],
         "lyrics": lyrics, "capo": capo,
         "source_url": url.strip(), "source": "MyChords", "source_warning": source_warning,
+        "suggested_shift": auto_shift,
     }
 
 
@@ -2687,10 +2703,17 @@ async def text_handler(message: Message):
             state["data"] = imported
             if imported.get("source") == "MyChords":
                 state["original_import"] = dict(imported)
-                state["import_shift"] = 0
+                state["import_shift"] = int(imported.get("suggested_shift", 0))
+                if state["import_shift"]:
+                    imported["lyrics"] = mychords_shift_chord_rows(
+                        state["original_import"]["lyrics"], state["import_shift"]
+                    )
+                    imported["song_key"] = transpose_key(
+                        state["original_import"].get("song_key", ""), state["import_shift"]
+                    )
             await wait_msg.edit_text(
-                imported_preview(imported), parse_mode="HTML",
-                reply_markup=imported_keyboard(imported),
+                imported_preview(imported, state.get("import_shift", 0)), parse_mode="HTML",
+                reply_markup=imported_keyboard(imported, state.get("import_shift", 0)),
             )
             return
 

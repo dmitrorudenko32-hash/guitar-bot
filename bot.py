@@ -380,56 +380,46 @@ async def import_from_mychords(url):
     if not song_div:
         raise ValueError("MyChords: не знайдено блок пісні.")
 
-    # Temporary safe diagnostic: only MyChords song HTML, no credentials.
+    # Diagnose original HTML metadata and HTTP variants without printing secrets.
     if "152138-nazarij-remchuk-gaj-zelenij-gaj" in url:
-        print("MYCHORDS_DIAG_BEGIN", flush=True)
-        print("MYCHORDS_DIAG_HTML_SIZE", len(html), flush=True)
-        print("MYCHORDS_DIAG_H1", repr(h1.get_text(" ", strip=True)), flush=True)
-        print("MYCHORDS_DIAG_SONG_ATTRS", repr(dict(song_div.attrs))[:600], flush=True)
-        print("MYCHORDS_DIAG_CHORD_LINKS", len(song_div.select("a.b-chord")), flush=True)
-        for n, child in enumerate(song_div.descendants):
-            if n >= 170:
-                break
-            if getattr(child, "name", None):
-                attrs = {k: str(v)[:90] for k, v in child.attrs.items()
-                         if k in ("class", "data-chord", "data-original", "data-key", "style", "title")}
-                if attrs:
-                    print("MYCHORDS_DIAG_TAG", n, child.name, repr(attrs)[:350], flush=True)
-            elif isinstance(child, str) and child.strip():
-                print("MYCHORDS_DIAG_TEXT", n, repr(child.strip())[:240], flush=True)
-        print("MYCHORDS_DIAG_END", flush=True)
-
-    # Compare server-rendered chord data across locales and cache variants.
-    # This is diagnostic only; it does not modify imported songs.
-    if "152138-nazarij-remchuk-gaj-zelenij-gaj" in url:
-        from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
-        parsed = urlsplit(url)
-        path_parts = parsed.path.split("/")
-        print("MYCHORDS_LOCALES_BEGIN", flush=True)
+        from urllib.parse import urlsplit, urlunsplit, urlencode
+        print("MYCHORDS_TRANS_BEGIN", flush=True)
+        for tag in soup.find_all(["script", "form", "input", "button", "select"]):
+            blob = str(tag)
+            if any(k in blob.lower() for k in ("/uk/trans", "transpose", "transpon", "tonality", "tonal", "b-accord", "originalkey", "original_key")):
+                # Only show local excerpts, never entire scripts or any credentials.
+                import html as htmlmod
+                clean = re.sub(r"\s+", " ", htmlmod.unescape(blob))
+                for word in ("/uk/trans", "transpose", "tonality", "b-accord", "original_key"):
+                    match = re.search(re.escape(word), clean, flags=re.I)
+                    if match:
+                        excerpt = clean[max(0, match.start()-110):match.end()+180]
+                        excerpt = re.sub(r"(?i)(token|secret|password|api[_-]?key)\s*[:=]\s*[^ ,;]+", r"\1=[REDACTED]", excerpt)
+                        print("MYCHORDS_TRANS_HINT", tag.name, repr(excerpt)[:350], flush=True)
+                        break
         timeout = ClientTimeout(total=18)
+        variants = [
+            ("baseline", {}, {}),
+            ("browser_headers", {"Referer": "https://mychords.net/", "Accept-Language": "uk-UA,uk;q=0.9"}, {}),
+            ("no_cookies", {"Cookie": ""}, {}),
+            ("cache_bust", {}, {"_diag": "1"}),
+        ]
         async with ClientSession(timeout=timeout, headers={
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/154.0.0.0 Safari/537.36",
-            "Accept-Language": "uk-UA,uk;q=0.9,en;q=0.7",
-        }) as diagnostic_session:
-            for locale in ("uk", "en", "de", "ru"):
-                test_parts = path_parts[:]
-                if len(test_parts) > 1:
-                    test_parts[1] = locale
-                test_url = urlunsplit((parsed.scheme, parsed.netloc, "/".join(test_parts), "", ""))
+        }) as session:
+            for label, headers, params in variants:
                 try:
-                    async with diagnostic_session.get(test_url, allow_redirects=True) as resp:
-                        test_html = await resp.text()
-                        test_soup = BeautifulSoup(test_html, "html.parser")
-                        test_song = test_soup.select_one("div.w-words__text")
-                        symbols = ([x.get_text(" ", strip=True) for x in test_song.select(".b-accord__symbol")]
-                                   if test_song else [])
-                        print("MYCHORDS_LOCALE", locale, "STATUS", resp.status,
-                              "FINAL_PATH", urlsplit(str(resp.url)).path,
-                              "CHORDS", repr(symbols[:24]),
-                              "COUNT", len(symbols), flush=True)
+                    async with session.get(url, headers=headers, params=params, allow_redirects=True) as resp:
+                        page = BeautifulSoup(await resp.text(), "html.parser")
+                        root = page.select_one(".w-words__text")
+                        chords = [x.get_text(" ", strip=True) for x in root.select(".b-accord__symbol")] if root else []
+                        cookie_names = sorted({c.split("=", 1)[0].strip() for c in resp.headers.getall("Set-Cookie", [])})
+                        print("MYCHORDS_TRANS_HTTP", label, "STATUS", resp.status,
+                              "CHORDS", repr(chords[:12]), "COUNT", len(chords),
+                              "SET_COOKIE_NAMES", repr(cookie_names), flush=True)
                 except Exception as exc:
-                    print("MYCHORDS_LOCALE", locale, "ERROR", type(exc).__name__, flush=True)
-        print("MYCHORDS_LOCALES_END", flush=True)
+                    print("MYCHORDS_TRANS_HTTP", label, "ERROR", type(exc).__name__, flush=True)
+        print("MYCHORDS_TRANS_END", flush=True)
 
     parts = []
     for node in song_div.stripped_strings:

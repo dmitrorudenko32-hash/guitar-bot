@@ -2065,6 +2065,9 @@ async def begin_add_song(user_id, send_func):
                 )
             ],
             [
+                InlineKeyboardButton(text="📸 Зі скриншотів", callback_data="add_by_screenshot")
+            ],
+            [
                 InlineKeyboardButton(
                     text="📝 Вручну",
                     callback_data="add_manual"
@@ -2121,6 +2124,102 @@ async def add_by_url(callback: CallbackQuery):
     )
 
 
+# ==================================================
+# БЕЗКОШТОВНЕ OCR СКРИНШОТІВ (Tesseract)
+# ==================================================
+
+def ocr_screenshot(data: bytes) -> str:
+    import pytesseract
+    from PIL import ImageOps, ImageEnhance, ImageFilter
+    with Image.open(io.BytesIO(data)) as original:
+        image = ImageOps.exif_transpose(original).convert("RGB")
+        if image.width < 1200:
+            scale = min(3, 1200 / max(image.width, 1))
+            image = image.resize((int(image.width * scale), int(image.height * scale)))
+        gray = ImageOps.grayscale(image)
+        gray = ImageEnhance.Contrast(gray).enhance(1.5)
+        gray = gray.filter(ImageFilter.SHARPEN)
+        return pytesseract.image_to_string(gray, lang="ukr+eng", config="--psm 6")
+
+
+def screenshot_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Усі скрини надіслано", callback_data="ocr_done")],
+        [InlineKeyboardButton(text="❌ Скасувати", callback_data="cancel_add")],
+    ])
+
+
+@dp.callback_query(F.data == "add_by_screenshot")
+async def add_by_screenshot(callback: CallbackQuery):
+    ADD_STATE[callback.from_user.id] = {"step": "ocr_images", "data": {}, "ocr_parts": []}
+    await edit_screen(callback,
+        "📸 <b>Імпорт зі скриншотів</b>\n\nНадішли скриншоти по черзі, зверху вниз (до 8). "
+        "Найкраще працюють чіткі зображення з видимими акордами.\n\n"
+        "Коли закінчиш, натисни «Усі скрини надіслано».", screenshot_keyboard())
+
+
+@dp.message(F.photo | F.document)
+async def receive_ocr_image(message: Message):
+    state = ADD_STATE.get(message.from_user.id)
+    if not state or state.get("step") != "ocr_images":
+        return
+    parts = state["ocr_parts"]
+    if len(parts) >= 8:
+        await message.answer("⚠️ Максимум 8 скриншотів. Натисни «Усі скрини надіслано».", reply_markup=screenshot_keyboard())
+        return
+    try:
+        if message.photo:
+            file_id = message.photo[-1].file_id
+        elif message.document and (message.document.mime_type or "").startswith("image/"):
+            file_id = message.document.file_id
+        else:
+            await message.answer("Надішли зображення JPG або PNG.")
+            return
+        file = await bot.get_file(file_id)
+        buffer = io.BytesIO()
+        await bot.download_file(file.file_path, destination=buffer)
+        raw = await asyncio.to_thread(ocr_screenshot, buffer.getvalue())
+        raw = raw.replace("\r", "").strip()
+        if len(raw) < 12:
+            await message.answer("⚠️ Майже нічого не розпізнав. Спробуй чіткіший скриншот.")
+            return
+        parts.append(raw)
+        await message.answer(
+            f"✅ Скриншот {len(parts)}/8 розпізнано. Надішли наступний або заверши.",
+            reply_markup=screenshot_keyboard())
+    except Exception as exc:
+        import logging
+        logging.exception("OCR failed")
+        await message.answer("❌ Не вдалося розпізнати зображення. "
+                             "Перевір, чи встановлено Tesseract з мовами ukr та eng. "
+                             f"Деталі: {escape_html(str(exc))[:250]}", parse_mode="HTML")
+
+
+@dp.callback_query(F.data == "ocr_done")
+async def ocr_done(callback: CallbackQuery):
+    state = ADD_STATE.get(callback.from_user.id)
+    if not state or state.get("step") != "ocr_images":
+        await callback.answer("Немає активного імпорту", show_alert=True)
+        return
+    if not state["ocr_parts"]:
+        await callback.answer("Спочатку надішли хоча б один скриншот", show_alert=True)
+        return
+    state["data"]["lyrics"] = "\n\n".join(state["ocr_parts"])
+    state["step"] = "ocr_title"
+    await edit_screen(callback, "🎵 <b>Як називається пісня?</b>\n\nНапиши назву повідомленням.")
+
+
+@dp.callback_query(F.data == "ocr_edit")
+async def ocr_edit(callback: CallbackQuery):
+    state = ADD_STATE.get(callback.from_user.id)
+    if not state or state.get("step") != "confirm_import" or state["data"].get("source") != "Скриншоти":
+        await callback.answer("Немає активного імпорту", show_alert=True)
+        return
+    state["step"] = "ocr_correct"
+    await edit_screen(callback, "✏️ Надішли <b>повний виправлений текст з акордами</b> одним повідомленням. "
+                      "Він замінить результат OCR.")
+
+
 @dp.callback_query(F.data == "add_manual")
 async def add_manual(callback: CallbackQuery):
     ADD_STATE[callback.from_user.id] = {
@@ -2167,7 +2266,7 @@ def imported_preview(data, shift=0):
         f"👤 {escape_html(data['artist'])}\n"
         f"🎸 Перший акорд: <b>{escape_html(tone)}</b>{note}\n\n"
         f"<pre>{escape_html(preview)}</pre>{warning}\n\n"
-        "Перевір акорди перед збереженням. Кнопки змінюють усі акорди на півтон."
+        "Перевір акорди перед збереженням. Для скриншотів можна виправити розпізнаний текст."
     )
 
 
@@ -2179,6 +2278,8 @@ def imported_keyboard(data, shift=0):
             InlineKeyboardButton(text=f"🎼 {shift:+d}", callback_data="imp_tone_reset"),
             InlineKeyboardButton(text="♯ +1", callback_data="imp_tone_up"),
         ])
+    if data.get("source") == "Скриншоти":
+        rows.append([InlineKeyboardButton(text="✏️ Виправити текст", callback_data="ocr_edit")])
     rows.append([InlineKeyboardButton(text="✅ Зберегти", callback_data="save_import")])
     rows.append([InlineKeyboardButton(text="❌ Скасувати", callback_data="cancel_add")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -2761,6 +2862,49 @@ async def text_handler(message: Message):
 
     if state:
         step = state["step"]
+
+        if step == "ocr_title":
+            state["data"]["title"] = text
+            state["step"] = "ocr_artist"
+            await message.answer("👤 Напиши <b>виконавця</b>:", parse_mode="HTML")
+            return
+
+        if step == "ocr_artist":
+            data = state["data"]
+            data["artist"] = text
+            existing_id = find_existing_song(data["title"], text)
+            if existing_id is not None:
+                ADD_STATE.pop(user_id, None)
+                await message.answer(duplicate_song_message(), parse_mode="HTML")
+                song = get_song(existing_id)
+                card_text, card_keyboard = song_card(song)
+                await message.answer(card_text, parse_mode="HTML", reply_markup=card_keyboard)
+                return
+            data["source"] = "Скриншоти"
+            data["source_url"] = ""
+            data["capo"] = 0
+            data["lyrics"] = normalize_song_text(data["lyrics"])
+            data["song_key"] = next(
+                (line.split()[0] for line in data["lyrics"].splitlines() if is_chord_line(line)), "")
+            state["step"] = "confirm_import"
+            await message.answer(
+                imported_preview(data), parse_mode="HTML", reply_markup=imported_keyboard(data))
+            return
+
+        if step == "ocr_correct":
+            data = state["data"]
+            data["lyrics"] = normalize_song_text(text)
+            data["song_key"] = next(
+                (line.split()[0] for line in data["lyrics"].splitlines() if is_chord_line(line)), "")
+            state["step"] = "confirm_import"
+            await message.answer(imported_preview(data), parse_mode="HTML",
+                                 reply_markup=imported_keyboard(data))
+            return
+
+        if step == "ocr_images":
+            await message.answer("📸 Надішли скриншот як фото або файл, а потім натисни кнопку завершення.",
+                                 reply_markup=screenshot_keyboard())
+            return
 
         if step == "url":
             if not text.lower().startswith(("http://", "https://")):

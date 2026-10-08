@@ -428,13 +428,23 @@ async def import_from_mychords(url):
             lines[-1] += " " + part
             index += 1
             continue
-        words = part.split()
-        fixed = [normalize_mychords_chord_token(w) for w in words]
-        if fixed and all(CHORD_TOKEN_RE.fullmatch(w) for w in fixed):
-            pending.extend(fixed)
+        # Ignore ornamental separators, never store them as lyrics.
+        if part in {"|", "¦", ".", "·", "—"}:
+            index += 1
+            continue
+        # MyChords can split the Ukrainian preposition «В»/«А» into a
+        # separate DOM node. Preserve it as text when followed by lyrics.
+        if part in {"А", "а", "В", "в", "A", "B"} and index + 1 < len(parts):
+            nxt = re.sub(r"\s+", " ", parts[index + 1]).strip()
+            if nxt and not is_mychords_chord_only(nxt) and not re.fullmatch(r"[|.·—]", nxt):
+                flush_chords()
+                lines.append(part + " " + nxt)
+                index += 2
+                continue
+        if is_mychords_chord_only(part):
+            pending.extend(normalize_mychords_chord_token(w) for w in part.split())
         else:
             flush_chords()
-            # Normalize mixed chord-prefix + lyric rows as well.
             normalized = normalize_mychords_import_text(part)
             lines.extend(normalized.splitlines() if normalized else [part])
         index += 1
@@ -1125,74 +1135,48 @@ def normalize_song_text(text):
 
 
 def normalize_mychords_chord_token(token):
-    """Fix common MyChords chord typos/Unicode lookalikes without changing lyrics."""
+    """Normalize a chord token, never apply this to ordinary lyric words."""
     token = str(token or "").strip().strip("|[](){}.,:;")
-    # Cyrillic lookalikes that sometimes appear in chord names on MyChords.
-    token = token.translate(str.maketrans({"А": "A", "В": "B", "С": "C", "Е": "E", "а": "a", "с": "c", "е": "e"}))
-    return token
+    return token.translate(str.maketrans({"А": "A", "В": "B", "С": "C", "Е": "E"}))
+
+
+def is_mychords_chord_only(text):
+    tokens = str(text).split()
+    return bool(tokens) and all(
+        CHORD_TOKEN_RE.fullmatch(normalize_mychords_chord_token(t)) for t in tokens
+    )
 
 
 def normalize_mychords_import_text(text):
-    """Normalize only MyChords imports: chord prefixes, Cyrillic chord letters and footer noise."""
+    """Split actual chord prefixes without mistaking Ukrainian words for chords."""
     if not text:
         return ""
-
-    text = str(text).replace("\r\n", "\n").replace("\r", "\n")
-    text = text.replace("\u00a0", " ").replace("\u200b", "")
-
-    stop_markers = (
-        "все ще шукаєш правильні акорди",
-        "глянь 5 інших доступних варіантів",
-        "інші варіанти цієї пісні",
-        "повідомити про помилку",
-        "відео від користувачів",
-        "коментарі",
-    )
-
     out = []
-    for raw in text.splitlines():
+    for raw in str(text).replace("\r", "").splitlines():
         line = re.sub(r"[ \t]+", " ", raw).strip()
-        if not line:
-            out.append("")
+        if not line or line in {"|", "¦", ".", "·"}:
             continue
-
-        low = line.lower()
-        if any(marker in low for marker in stop_markers):
-            break
-
-        # Repair punctuation/lookalikes token-by-token. This handles e.g. Аm -> Am, E. -> E.
         parts = line.split()
-        fixed_parts = []
-        for p in parts:
-            core = p.strip("|[](){}.,:;")
-            fixed = normalize_mychords_chord_token(core)
-            if CHORD_TOKEN_RE.fullmatch(fixed):
-                # For chord tokens discard punctuation such as E. -> E.
-                fixed_parts.append(fixed)
-            else:
-                fixed_parts.append(p)
-        line = " ".join(fixed_parts)
-
-        # Split a leading run of chords from lyrics: "Am Dm Темна ніч..." -> two rows.
-        parts = line.split()
-        chord_prefix = []
+        prefix = []
         pos = 0
         while pos < len(parts):
-            tok = normalize_mychords_chord_token(parts[pos])
-            if CHORD_TOKEN_RE.fullmatch(tok):
-                chord_prefix.append(tok)
-                pos += 1
-            else:
+            token = normalize_mychords_chord_token(parts[pos])
+            if not CHORD_TOKEN_RE.fullmatch(token):
                 break
-
-        if chord_prefix and pos < len(parts):
-            lyric = " ".join(parts[pos:]).strip()
-            out.append(" ".join(chord_prefix))
-            out.append(lyric)
+            # A/B/C etc. at the beginning of a Ukrainian sentence may be
+            # prepositions, not chords. Never peel off a single-letter prefix.
+            if len(token) == 1 and len(parts) > pos + 1 and re.search(
+                r"[А-Яа-яІіЇїЄєҐґ]", " ".join(parts[pos + 1:])
+            ):
+                break
+            prefix.append(token)
+            pos += 1
+        if prefix and pos < len(parts):
+            out.append(" ".join(prefix))
+            out.append(" ".join(parts[pos:]))
         else:
             out.append(line)
-
-    return normalize_song_text(repair_glued_leading_chords("\n".join(out)))
+    return normalize_song_text("\n".join(out))
 
 
 def normalize_manual_song_text(text):

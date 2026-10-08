@@ -455,6 +455,27 @@ async def import_from_mychords(url):
             print("MYCHORDS_JS_SESSION_ERROR", type(exc).__name__, flush=True)
         print("MYCHORDS_JS_END", flush=True)
 
+    # Focused JS transpose handler diagnostic (read-only).
+    if "152138-nazarij-remchuk-gaj-zelenij-gaj" in url:
+        from urllib.parse import urljoin
+        print("MYCHORDS_HANDLER_BEGIN", flush=True)
+        try:
+            js_url = urljoin(url, "/i/js/dist/app.main.js")
+            async with ClientSession(timeout=ClientTimeout(total=25), headers={"User-Agent": "Mozilla/5.0"}) as handler_session:
+                async with handler_session.get(js_url) as js_resp:
+                    js = await js_resp.text() if js_resp.status == 200 else ""
+                    print("MYCHORDS_HANDLER_JS_STATUS", js_resp.status, "LENGTH", len(js), flush=True)
+                    needles = ["transposePrevState", "this.textBlock.dataset", "this.textBlock.getAttribute", "this.textBlock", "data-url", "transposeInput", "tone-value", "application/json", "fetch(", "axios", "/trans"]
+                    for needle in needles:
+                        occurrences = list(re.finditer(re.escape(needle), js, re.I))
+                        print("MYCHORDS_HANDLER_NEEDLE", repr(needle), "COUNT", len(occurrences), flush=True)
+                        for match in occurrences[-3:]:
+                            snippet = js[max(0, match.start()-650):min(len(js), match.end()+1000)]
+                            print("MYCHORDS_HANDLER_CONTEXT", repr(needle), repr(snippet[:1700]), flush=True)
+        except Exception as exc:
+            print("MYCHORDS_HANDLER_ERROR", type(exc).__name__, str(exc)[:160], flush=True)
+        print("MYCHORDS_HANDLER_END", flush=True)
+
     parts = []
     for node in song_div.stripped_strings:
         raw = str(node).replace("\xa0", " ").replace("\u200b", "")

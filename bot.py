@@ -368,6 +368,53 @@ async def fetch_html(url):
             return await response.text()
 
 
+def repair_mychords_minor_dominant(lyrics):
+    """Conservative, key-independent harmonic correction of chord-only rows.
+
+    E.g. Gm/G/Cm -> Gm/D/Cm; the optional +2 then gives Am/E/Dm.
+    Ambiguous or extended chord progressions are left untouched.
+    """
+    from collections import Counter
+
+    rows = lyrics.splitlines()
+    chords = [chord for row in rows if is_chord_line(row)
+              for chord in _chords_from_line(row)]
+    if len(chords) < 8:
+        return lyrics
+    counts = Counter(chords)
+    simple = [c for c in chords if re.fullmatch(r"[A-G](?:#|b)?m?", c)]
+    if len(simple) != len(chords):
+        return lyrics
+    minors = [(c, n) for c, n in counts.items() if c.endswith("m")]
+    if not minors:
+        return lyrics
+    tonic, tonic_count = max(minors, key=lambda pair: pair[1])
+    tonic_note = tonic[:-1]
+    tonic_idx = NOTE_TO_INDEX.get(tonic_note)
+    if tonic_idx is None or tonic_count < 3:
+        return lyrics
+    fourth = CHROMATIC_SHARPS[(tonic_idx + 5) % 12] + "m"
+    fifth = CHROMATIC_SHARPS[(tonic_idx + 7) % 12]
+    parallel = tonic_note
+    # Require both harmonic context and the absence of the expected dominant.
+    if counts.get(fourth, 0) < 2 or counts.get(parallel, 0) < 2 or counts.get(fifth, 0):
+        return lyrics
+    if counts[tonic] + counts[fourth] + counts[parallel] < len(chords) * 0.85:
+        return lyrics
+    # Only correct when the entire chord vocabulary is these three chords.
+    # This intentionally skips less clear songs instead of silently corrupting them.
+    if set(counts) != {tonic, fourth, parallel}:
+        return lyrics
+    fixed = []
+    for row in rows:
+        if is_chord_line(row):
+            fixed.append(" ".join(fifth if c == parallel else c
+                                  for c in _chords_from_line(row)))
+        else:
+            fixed.append(row)
+    return "\n".join(fixed)
+
+
 async def import_from_mychords(url):
     """Read the separate DOM text nodes returned to Render by MyChords."""
     html = await fetch_html(url)
@@ -470,20 +517,13 @@ async def import_from_mychords(url):
                 chord_rows.append(row)
         lyrics = "\n".join(chord_rows)
 
-    # The published browser arrangement of this particular song differs from
-    # the HTML returned to server-side clients: Gm/G/Cm versus Am/E/Dm.
-    # Correct only the major G chord (to D), so an optional +2 shift gives E.
-    # Do not change any other song or minor Gm chord.
-    if re.search(r"/152138-nazarij-remchuk-gaj-zelenij-gaj\.html", urlparse(url).path):
-        corrected_rows = []
-        for row in lyrics.splitlines():
-            if is_chord_line(row):
-                corrected_rows.append(" ".join(
-                    "D" if chord == "G" else chord for chord in _chords_from_line(row)
-                ))
-            else:
-                corrected_rows.append(row)
-        lyrics = "\n".join(corrected_rows)
+    # General, conservative harmonic correction for a common MyChords
+    # server-side discrepancy. It is NOT a guarantee of matching the browser.
+    # If a minor tonic and its minor subdominant dominate the arrangement,
+    # while the parallel major tonic occurs but the major dominant is absent,
+    # the parallel major is likely a mislabeled dominant in this source.
+    # Only touch whole chord rows; never alter the lyrics.
+    lyrics = repair_mychords_minor_dominant(lyrics)
 
     chords = [c for line in lyrics.splitlines() if is_chord_line(line)
               for c in _chords_from_line(line)]

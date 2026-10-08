@@ -380,101 +380,44 @@ async def import_from_mychords(url):
     if not song_div:
         raise ValueError("MyChords: не знайдено блок пісні.")
 
-    # Diagnose original HTML metadata and HTTP variants without printing secrets.
-    if "152138-nazarij-remchuk-gaj-zelenij-gaj" in url:
-        from urllib.parse import urlsplit, urlunsplit, urlencode
-        print("MYCHORDS_TRANS_BEGIN", flush=True)
-        for tag in soup.find_all(["script", "form", "input", "button", "select"]):
-            blob = str(tag)
-            if any(k in blob.lower() for k in ("/uk/trans", "transpose", "transpon", "tonality", "tonal", "b-accord", "originalkey", "original_key")):
-                # Only show local excerpts, never entire scripts or any credentials.
-                import html as htmlmod
-                clean = re.sub(r"\s+", " ", htmlmod.unescape(blob))
-                for word in ("/uk/trans", "transpose", "tonality", "b-accord", "original_key"):
-                    match = re.search(re.escape(word), clean, flags=re.I)
-                    if match:
-                        excerpt = clean[max(0, match.start()-110):match.end()+180]
-                        excerpt = re.sub(r"(?i)(token|secret|password|api[_-]?key)\s*[:=]\s*[^ ,;]+", r"\1=[REDACTED]", excerpt)
-                        print("MYCHORDS_TRANS_HINT", tag.name, repr(excerpt)[:350], flush=True)
-                        break
-        timeout = ClientTimeout(total=18)
-        variants = [
-            ("baseline", {}, {}),
-            ("browser_headers", {"Referer": "https://mychords.net/", "Accept-Language": "uk-UA,uk;q=0.9"}, {}),
-            ("no_cookies", {"Cookie": ""}, {}),
-            ("cache_bust", {}, {"_diag": "1"}),
-        ]
-        async with ClientSession(timeout=timeout, headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/154.0.0.0 Safari/537.36",
-        }) as session:
-            for label, headers, params in variants:
-                try:
-                    async with session.get(url, headers=headers, params=params, allow_redirects=True) as resp:
-                        page = BeautifulSoup(await resp.text(), "html.parser")
-                        root = page.select_one(".w-words__text")
-                        chords = [x.get_text(" ", strip=True) for x in root.select(".b-accord__symbol")] if root else []
-                        cookie_names = sorted({c.split("=", 1)[0].strip() for c in resp.headers.getall("Set-Cookie", [])})
-                        print("MYCHORDS_TRANS_HTTP", label, "STATUS", resp.status,
-                              "CHORDS", repr(chords[:12]), "COUNT", len(chords),
-                              "SET_COOKIE_NAMES", repr(cookie_names), flush=True)
-                except Exception as exc:
-                    print("MYCHORDS_TRANS_HTTP", label, "ERROR", type(exc).__name__, flush=True)
-        print("MYCHORDS_TRANS_END", flush=True)
-
-    # JS-only diagnostic: inspect scripts and transpose references, no POST requests.
-    if "152138-nazarij-remchuk-gaj-zelenij-gaj" in url:
-        from urllib.parse import urljoin, urlsplit
-        print("MYCHORDS_JS_BEGIN", flush=True)
-        script_urls = []
-        for script in soup.find_all("script"):
-            src = script.get("src")
-            if src:
-                full = urljoin(url, src)
-                if urlsplit(full).netloc == urlsplit(url).netloc:
-                    script_urls.append(full)
-            else:
-                content = script.get_text() or ""
-                for m in list(re.finditer(r"(?i)(/uk/trans|/trans|b-transpose|b-accord__symbol|tone-value)", content))[:6]:
-                    print("MYCHORDS_JS_INLINE", repr(re.sub(r"\s+", " ", content[max(0,m.start()-160):m.end()+220]))[:450], flush=True)
-        print("MYCHORDS_JS_SCRIPT_COUNT", len(script_urls), flush=True)
-        for src in script_urls[-12:]:
-            print("MYCHORDS_JS_SRC", urlsplit(src).path[:180], flush=True)
-        try:
-            async with ClientSession(timeout=ClientTimeout(total=22), headers={"User-Agent": "Mozilla/5.0"}) as js_session:
-                for src in script_urls[-8:]:
-                    try:
-                        async with js_session.get(src) as resp:
-                            content = (await resp.text())[:1200000] if resp.status == 200 else ""
-                            matches = list(re.finditer(r"(?i)(/uk/trans|/trans|b-transpose|b-accord__symbol|tone-value|tone-up|tone-down)", content))
-                            print("MYCHORDS_JS_FILE", urlsplit(src).path[-100:], "STATUS", resp.status, "MATCHES", len(matches), flush=True)
-                            for m in matches[:8]:
-                                print("MYCHORDS_JS_MATCH", repr(re.sub(r"\s+", " ", content[max(0,m.start()-190):m.end()+240]))[:520], flush=True)
-                    except Exception as exc:
-                        print("MYCHORDS_JS_ERROR", type(exc).__name__, flush=True)
-        except Exception as exc:
-            print("MYCHORDS_JS_SESSION_ERROR", type(exc).__name__, flush=True)
-        print("MYCHORDS_JS_END", flush=True)
-
-    # Focused JS transpose handler diagnostic (read-only).
+    # Focused MyChords transpose endpoint test, only for this example song.
+    # Uses the exact form fields found in MyChords' own JavaScript.
     if "152138-nazarij-remchuk-gaj-zelenij-gaj" in url:
         from urllib.parse import urljoin
-        print("MYCHORDS_HANDLER_BEGIN", flush=True)
+        endpoint = urljoin(url, song_div.get("data-url", "/uk/trans"))
+        print("MYCHORDS_POST_BEGIN", flush=True)
         try:
-            js_url = urljoin(url, "/i/js/dist/app.main.js")
-            async with ClientSession(timeout=ClientTimeout(total=25), headers={"User-Agent": "Mozilla/5.0"}) as handler_session:
-                async with handler_session.get(js_url) as js_resp:
-                    js = await js_resp.text() if js_resp.status == 200 else ""
-                    print("MYCHORDS_HANDLER_JS_STATUS", js_resp.status, "LENGTH", len(js), flush=True)
-                    needles = ["transposePrevState", "this.textBlock.dataset", "this.textBlock.getAttribute", "this.textBlock", "data-url", "transposeInput", "tone-value", "application/json", "fetch(", "axios", "/trans"]
-                    for needle in needles:
-                        occurrences = list(re.finditer(re.escape(needle), js, re.I))
-                        print("MYCHORDS_HANDLER_NEEDLE", repr(needle), "COUNT", len(occurrences), flush=True)
-                        for match in occurrences[-3:]:
-                            snippet = js[max(0, match.start()-650):min(len(js), match.end()+1000)]
-                            print("MYCHORDS_HANDLER_CONTEXT", repr(needle), repr(snippet[:1700]), flush=True)
+            async with ClientSession(timeout=ClientTimeout(total=20), headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/154.0 Safari/537.36",
+                "X-Requested-With": "XMLHttpRequest",
+                "Referer": url,
+                "Origin": "https://mychords.net",
+                "Accept": "text/html, */*; q=0.01",
+            }) as post_session:
+                # Load first to obtain any session cookies the server sets.
+                async with post_session.get(url) as first_resp:
+                    await first_resp.read()
+                    print("MYCHORDS_POST_INITIAL", first_resp.status, flush=True)
+                for tone, direction in [(0, "up"), (0, "down"), (1, "up"), (-1, "down"), (2, "up")]:
+                    try:
+                        async with post_session.post(endpoint, data={
+                            "host": url, "transpose": str(tone), "direction": direction,
+                        }) as response:
+                            body = await response.text()
+                            fragment = BeautifulSoup(body, "html.parser")
+                            chord_spans = fragment.select(".b-accord__symbol")
+                            chords = [x.get_text(" ", strip=True) for x in chord_spans]
+                            print("MYCHORDS_POST_RESULT", "TONE", tone, "DIRECTION", direction,
+                                  "STATUS", response.status, "LENGTH", len(body),
+                                  "CHORD_COUNT", len(chords), "CHORDS", repr(chords[:16]),
+                                  "ERROR_HINT", repr(fragment.get_text(" ", strip=True)[:120]) if not chords else "none",
+                                  flush=True)
+                    except Exception as exc:
+                        print("MYCHORDS_POST_ERROR", "TONE", tone, "DIRECTION", direction,
+                              type(exc).__name__, str(exc)[:100], flush=True)
         except Exception as exc:
-            print("MYCHORDS_HANDLER_ERROR", type(exc).__name__, str(exc)[:160], flush=True)
-        print("MYCHORDS_HANDLER_END", flush=True)
+            print("MYCHORDS_POST_SESSION_ERROR", type(exc).__name__, str(exc)[:100], flush=True)
+        print("MYCHORDS_POST_END", flush=True)
 
     parts = []
     for node in song_div.stripped_strings:

@@ -368,55 +368,76 @@ async def fetch_html(url):
             return await response.text()
 
 
-def repair_mychords_minor_dominant(lyrics):
-    """Conservative, key-independent harmonic correction of chord-only rows.
+def mychords_dom_lines(song_div):
+    """Extract visual song lines, respecting HTML <br> and block boundaries.
 
-    E.g. Gm/G/Cm -> Gm/D/Cm; the optional +2 then gives Am/E/Dm.
-    Ambiguous or extended chord progressions are left untouched.
+    Unlike stripped_strings, this does not erase line boundaries or join
+    consecutive chords from unrelated lines.
     """
-    from collections import Counter
+    from bs4 import NavigableString, Tag
 
-    rows = lyrics.splitlines()
-    chords = [chord for row in rows if is_chord_line(row)
-              for chord in _chords_from_line(row)]
-    if len(chords) < 8:
-        return lyrics
-    counts = Counter(chords)
-    simple = [c for c in chords if re.fullmatch(r"[A-G](?:#|b)?m?", c)]
-    if len(simple) != len(chords):
-        return lyrics
-    minors = [(c, n) for c, n in counts.items() if c.endswith("m")]
-    if not minors:
-        return lyrics
-    tonic, tonic_count = max(minors, key=lambda pair: pair[1])
-    tonic_note = tonic[:-1]
-    tonic_idx = NOTE_TO_INDEX.get(tonic_note)
-    if tonic_idx is None or tonic_count < 3:
-        return lyrics
-    fourth = CHROMATIC_SHARPS[(tonic_idx + 5) % 12] + "m"
-    fifth = CHROMATIC_SHARPS[(tonic_idx + 7) % 12]
-    parallel = tonic_note
-    # Require both harmonic context and the absence of the expected dominant.
-    if counts.get(fourth, 0) < 2 or counts.get(parallel, 0) < 2 or counts.get(fifth, 0):
-        return lyrics
-    if counts[tonic] + counts[fourth] + counts[parallel] < len(chords) * 0.85:
-        return lyrics
-    # Only correct when the entire chord vocabulary is these three chords.
-    # This intentionally skips less clear songs instead of silently corrupting them.
-    if set(counts) != {tonic, fourth, parallel}:
-        return lyrics
-    fixed = []
-    for row in rows:
-        if is_chord_line(row):
-            fixed.append(" ".join(fifth if c == parallel else c
-                                  for c in _chords_from_line(row)))
+    rows = []
+    current = []
+    block_tags = {"div", "p", "section", "article", "pre", "li"}
+    chord_classes = {"chord", "chords", "w-words__chord", "w-words__chords"}
+
+    def flush():
+        if not current:
+            return
+        raw = "".join(current).replace("\xa0", " ").replace("\u200b", "")
+        current.clear()
+        value = re.sub(r"[ \t]+", " ", raw).strip()
+        if value:
+            rows.append(value)
+        elif rows and rows[-1] != "":
+            rows.append("")
+
+    def append_text(value):
+        value = str(value).replace("\r\n", "\n").replace("\r", "\n")
+        parts = value.split("\n")
+        for i, part in enumerate(parts):
+            if i:
+                flush()
+            current.append(part)
+
+    def walk(node):
+        if isinstance(node, NavigableString):
+            append_text(node)
+            return
+        if not isinstance(node, Tag):
+            return
+        name = node.name.lower() if node.name else ""
+        if name in {"script", "style", "svg", "button"}:
+            return
+        if name == "br":
+            flush()
+            return
+        is_block = name in block_tags and node is not song_div
+        if is_block:
+            flush()
+        classes = set(node.get("class", []))
+        is_chord = bool(classes & chord_classes) or (name in {"span", "b", "strong", "a"} and
+                     (node.get("data-chord") is not None or "chord" in " ".join(classes).lower()))
+        if is_chord:
+            token = node.get_text(" ", strip=True)
+            if token:
+                if current and current[-1] and not current[-1].endswith((" ", "\t")):
+                    current.append(" ")
+                current.append(token)
+                current.append(" ")
         else:
-            fixed.append(row)
-    return "\n".join(fixed)
+            for child in node.children:
+                walk(child)
+        if is_block:
+            flush()
+
+    walk(song_div)
+    flush()
+    return rows
 
 
 async def import_from_mychords(url):
-    """Read the separate DOM text nodes returned to Render by MyChords."""
+    """Import the exact chord tokens in MyChords HTML, preserving line breaks."""
     html = await fetch_html(url)
     soup = BeautifulSoup(html, "html.parser")
     h1 = soup.find("h1")
@@ -427,28 +448,14 @@ async def import_from_mychords(url):
     if not song_div:
         raise ValueError("MyChords: не знайдено блок пісні.")
 
-    parts = []
-    for node in song_div.stripped_strings:
-        raw = str(node).replace("\xa0", " ").replace("\u200b", "")
-        parts.extend(x.strip() for x in raw.splitlines() if x.strip())
-
+    source_lines = mychords_dom_lines(song_div)
     lines = []
-    pending = []
     capo = 0
-    index = 0
-
-    def flush_chords():
-        if pending:
-            for i in range(0, len(pending), 4):
-                lines.append(" ".join(pending[i:i+4]))
-            pending.clear()
-
-    while index < len(parts):
-        part = re.sub(r"\s+", " ", parts[index]).strip()
-        # MyChords keeps punctuation and repeat labels in separate DOM nodes.
-        # These are layout marks, not song lyrics or chord symbols.
-        if re.fullmatch(r"[:|¦·.\-–—]+|[}\]]\s*[xх×]\s*\d+|[xх×]\s*\d+", part, re.I):
-            index += 1
+    for raw in source_lines:
+        part = re.sub(r"[ \t]+", " ", raw).strip()
+        if not part:
+            if lines and lines[-1] != "":
+                lines.append("")
             continue
         low = part.lower()
         if any(x in low for x in (
@@ -460,75 +467,28 @@ async def import_from_mychords(url):
         cm = re.search(r"кап[оі]дастер\s+на\s+(\d+)\s+лад", low)
         if cm:
             capo = int(cm.group(1))
-            index += 1
             continue
-        if re.fullmatch(r"вст\.?|вступ\.?|intro\.?", low.rstrip(":")) :
-            flush_chords()
+        if re.fullmatch(r"[:|¦·.\-–—]+|[}\]]\s*[xх×]\s*\d+|[xх×]\s*\d+", part, re.I):
+            continue
+        if re.fullmatch(r"(?:вст\.?|вступ\.?|intro\.?)\s*:?", low):
             lines.append("ВСТУП")
-            index += 1
             continue
-        if re.fullmatch(r"куплет|приспів|програш|брідж|міст", low.rstrip(":")):
-            flush_chords()
-            heading = part.upper()
-            if index + 1 < len(parts) and re.fullmatch(r"\d{1,2}", parts[index+1].strip()):
-                heading += " " + parts[index+1].strip()
-                index += 1
-            lines.append(heading)
-            index += 1
+        if re.fullmatch(r"(?:куплет|приспів|програш|брідж|міст)(?:\s+\d{1,2})?\s*:?", low):
+            lines.append(part.upper().rstrip(":"))
             continue
-        if re.fullmatch(r"\d{1,2}", part) and lines and re.match(r"^(КУПЛЕТ|ПРИСПІВ)\b", lines[-1]):
-            lines[-1] += " " + part
-            index += 1
-            continue
-        # Ignore ornamental separators, never store them as lyrics.
-        if part in {"|", "¦", ".", "·", "—", ":", "}x2"}:
-            index += 1
-            continue
-        # MyChords can split the Ukrainian preposition «В»/«А» into a
-        # separate DOM node. Preserve it as text when followed by lyrics.
-        if part in {"А", "а", "В", "в", "A", "B"} and index + 1 < len(parts):
-            nxt = re.sub(r"\s+", " ", parts[index + 1]).strip()
-            if nxt and not is_mychords_chord_only(nxt) and not re.fullmatch(r"[|.·—]", nxt):
-                flush_chords()
-                lines.append(part + " " + nxt)
-                index += 2
-                continue
+        # Preserve real chord lines and split chords from a combined row.
         if is_mychords_chord_only(part):
-            pending.extend(normalize_mychords_chord_token(w) for w in part.split())
-        else:
-            flush_chords()
-            normalized = normalize_mychords_import_text(part)
-            if normalized:
-                lines.extend(normalized.splitlines())
-        index += 1
-    flush_chords()
+            lines.append(" ".join(normalize_mychords_chord_token(w) for w in part.split()))
+            continue
+        normalized = normalize_mychords_import_text(part)
+        if normalized:
+            lines.extend(normalized.splitlines())
+
     lyrics = normalize_song_text("\n".join(lines))
-
-    # MyChords sometimes returns an alternate, non-equivalent chord set to
-    # server-side requests. For this one verified song, restore the chords
-    # from the public primary version; never rewrite lyric text.
-    if re.search(r"/120574-ukrayinski-narodni-guculka-ksenya\.html", urlparse(url).path):
-        chord_map = {"Fm": "Am", "Gm": "Dm", "F": "E", "C": "F"}
-        chord_rows = []
-        for row in lyrics.splitlines():
-            if is_chord_line(row):
-                chord_rows.append(" ".join(chord_map.get(c, c) for c in _chords_from_line(row)))
-            else:
-                chord_rows.append(row)
-        lyrics = "\n".join(chord_rows)
-
-    # General, conservative harmonic correction for a common MyChords
-    # server-side discrepancy. It is NOT a guarantee of matching the browser.
-    # If a minor tonic and its minor subdominant dominate the arrangement,
-    # while the parallel major tonic occurs but the major dominant is absent,
-    # the parallel major is likely a mislabeled dominant in this source.
-    # Only touch whole chord rows; never alter the lyrics.
-    lyrics = repair_mychords_minor_dominant(lyrics)
-
-    chords = [c for line in lyrics.splitlines() if is_chord_line(line)
-              for c in _chords_from_line(line)]
+    chords = [c for row in lyrics.splitlines() if is_chord_line(row)
+              for c in _chords_from_line(row)]
     if len(chords) < 2:
-        raise ValueError("MyChords: у тексті не вдалося знайти акорди.")
+        raise ValueError("MyChords: не вдалося знайти акорди. Перевір посилання.")
     if artist == "Невідомий виконавець" and "ukrayinski-narodni" in url:
         artist = "Українські народні"
     return {
@@ -536,6 +496,7 @@ async def import_from_mychords(url):
         "lyrics": lyrics, "capo": capo,
         "source_url": url.strip(), "source": "MyChords",
     }
+
 
 def normalize_diez_chord_rows(text):
     """Group consecutive Diez chord-only lines into compact rows (max 4 chords)."""

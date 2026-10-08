@@ -470,35 +470,6 @@ def mychords_dom_lines(song_div):
     return rows
 
 
-def mychords_restore_lyric_breaks(line):
-    """Conservative recovery of verse breaks omitted by MyChords itself.
-
-    The source sometimes combines two capitalized phrases into one lyric row.
-    Split only long Cyrillic lyric rows at an internal capitalized word, after
-    at least three words and with at least three words following it. Chords
-    remain unchanged; this is a readability heuristic, not source fidelity.
-    """
-    words = line.split()
-    if len(words) < 8 or len(line) < 55:
-        return [line]
-    candidates = []
-    for i in range(3, len(words) - 3):
-        word = words[i]
-        prev = words[i - 1]
-        if not re.match(r"^[А-ЯІЇЄҐ][а-яіїєґ']+", word):
-            continue
-        if not re.search(r"[а-яіїєґ,]$", prev, re.I):
-            continue
-        if prev.endswith(('.', '!', '?', ':', ';')):
-            continue
-        candidates.append(i)
-    if not candidates:
-        return [line]
-    # Prefer a split near the middle of a combined verse row.
-    cut = min(candidates, key=lambda i: abs(i - len(words) / 2))
-    return [' '.join(words[:cut]), ' '.join(words[cut:])]
-
-
 async def import_from_mychords(url):
     """Import the exact chord tokens in MyChords HTML, preserving line breaks."""
     html = await fetch_html(url)
@@ -510,6 +481,50 @@ async def import_from_mychords(url):
     song_div = soup.find("div", class_="w-words__text")
     if not song_div:
         raise ValueError("MyChords: не знайдено блок пісні.")
+
+    # MyChords sometimes returns a server-side transposed variant that differs
+    # from the song's canonical key. Try the same song in other language routes
+    # BEFORE falling back to semitone shifting. Never invent chord substitutions.
+    slug = urlparse(url).path.rsplit("/", 1)[-1].lower()
+    key_match = re.search(r"-([a-g](?:-sharp|-flat|s|b)?m?)\.html$", slug)
+    expected_key = ""
+    if key_match:
+        raw_key = key_match.group(1).replace("-sharp", "#").replace("-flat", "b")
+        expected_key = raw_key[0].upper() + raw_key[1:]
+
+    def first_chord_of(div):
+        for line in mychords_dom_lines(div):
+            if is_mychords_chord_only(line):
+                return normalize_mychords_chord_token(line.split()[0])
+        return ""
+
+    initial_chord = first_chord_of(song_div)
+    if expected_key and initial_chord.lower() != expected_key.lower():
+        from urllib.parse import urlunparse
+        parsed = urlparse(url)
+        segments = parsed.path.split("/")
+        # Locale variants of the SAME song ID; do not search for a different song.
+        if len(segments) > 2 and segments[1] in {"uk", "ru", "en"}:
+            base_path = "/" + "/".join(segments[2:])
+        else:
+            base_path = parsed.path
+        variants = ["/uk" + base_path, "/ru" + base_path, base_path]
+        seen = {parsed.path}
+        for path in variants:
+            if path in seen:
+                continue
+            seen.add(path)
+            candidate_url = urlunparse(parsed._replace(path=path, query="", fragment=""))
+            try:
+                candidate_html = await fetch_html(candidate_url)
+                candidate_soup = BeautifulSoup(candidate_html, "html.parser")
+                candidate_div = candidate_soup.find("div", class_="w-words__text")
+                if candidate_div and first_chord_of(candidate_div).lower() == expected_key.lower():
+                    song_div = candidate_div
+                    break
+            except Exception:
+                # If alternate routes fail, retain the original response.
+                pass
 
     source_lines = mychords_dom_lines(song_div)
     lines = []
@@ -548,9 +563,7 @@ async def import_from_mychords(url):
         part = re.sub(r"^,\s*", "", part)
         part = re.sub(r"\s+([,.;:!?])", r"\1", part)
         part = re.sub(r"([,;:!?])(?=[А-Яа-яІіЇїЄєҐґ])", r"\1 ", part)
-        # MyChords sometimes combines two lyric phrases in its own HTML.
-        # Recover only obvious long-line boundaries; never alter chords.
-        lines.extend(mychords_restore_lyric_breaks(part))
+        lines.append(part)
 
     lyrics = normalize_song_text("\n".join(lines))
     chords = [c for row in lyrics.splitlines() if is_chord_line(row)

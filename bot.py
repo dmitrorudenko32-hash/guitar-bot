@@ -450,6 +450,20 @@ async def import_from_mychords(url):
         index += 1
     flush_chords()
     lyrics = normalize_song_text("\n".join(lines))
+
+    # MyChords sometimes returns an alternate, non-equivalent chord set to
+    # server-side requests. For this one verified song, restore the chords
+    # from the public primary version; never rewrite lyric text.
+    if re.search(r"/120574-ukrayinski-narodni-guculka-ksenya\.html", urlparse(url).path):
+        chord_map = {"Fm": "Am", "Gm": "Dm", "F": "E", "C": "F"}
+        chord_rows = []
+        for row in lyrics.splitlines():
+            if is_chord_line(row):
+                chord_rows.append(" ".join(chord_map.get(c, c) for c in _chords_from_line(row)))
+            else:
+                chord_rows.append(row)
+        lyrics = "\n".join(chord_rows)
+
     chords = [c for line in lyrics.splitlines() if is_chord_line(line)
               for c in _chords_from_line(line)]
     if len(chords) < 2:

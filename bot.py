@@ -380,45 +380,6 @@ async def import_from_mychords(url):
     if not song_div:
         raise ValueError("MyChords: не знайдено блок пісні.")
 
-    # Focused MyChords transpose endpoint test, only for this example song.
-    # Uses the exact form fields found in MyChords' own JavaScript.
-    if "152138-nazarij-remchuk-gaj-zelenij-gaj" in url:
-        from urllib.parse import urljoin
-        endpoint = urljoin(url, song_div.get("data-url", "/uk/trans"))
-        print("MYCHORDS_POST_BEGIN", flush=True)
-        try:
-            async with ClientSession(timeout=ClientTimeout(total=20), headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/154.0 Safari/537.36",
-                "X-Requested-With": "XMLHttpRequest",
-                "Referer": url,
-                "Origin": "https://mychords.net",
-                "Accept": "text/html, */*; q=0.01",
-            }) as post_session:
-                # Load first to obtain any session cookies the server sets.
-                async with post_session.get(url) as first_resp:
-                    await first_resp.read()
-                    print("MYCHORDS_POST_INITIAL", first_resp.status, flush=True)
-                for tone, direction in [(0, "up"), (0, "down"), (1, "up"), (-1, "down"), (2, "up")]:
-                    try:
-                        async with post_session.post(endpoint, data={
-                            "host": url, "transpose": str(tone), "direction": direction,
-                        }) as response:
-                            body = await response.text()
-                            fragment = BeautifulSoup(body, "html.parser")
-                            chord_spans = fragment.select(".b-accord__symbol")
-                            chords = [x.get_text(" ", strip=True) for x in chord_spans]
-                            print("MYCHORDS_POST_RESULT", "TONE", tone, "DIRECTION", direction,
-                                  "STATUS", response.status, "LENGTH", len(body),
-                                  "CHORD_COUNT", len(chords), "CHORDS", repr(chords[:16]),
-                                  "ERROR_HINT", repr(fragment.get_text(" ", strip=True)[:120]) if not chords else "none",
-                                  flush=True)
-                    except Exception as exc:
-                        print("MYCHORDS_POST_ERROR", "TONE", tone, "DIRECTION", direction,
-                              type(exc).__name__, str(exc)[:100], flush=True)
-        except Exception as exc:
-            print("MYCHORDS_POST_SESSION_ERROR", type(exc).__name__, str(exc)[:100], flush=True)
-        print("MYCHORDS_POST_END", flush=True)
-
     parts = []
     for node in song_div.stripped_strings:
         raw = str(node).replace("\xa0", " ").replace("\u200b", "")
@@ -2023,6 +1984,71 @@ async def add_manual(callback: CallbackQuery):
     )
 
 
+def mychords_shift_chord_rows(lyrics, semitones):
+    """Transpose only chord-only rows, never ordinary Ukrainian lyrics."""
+    if not semitones:
+        return lyrics
+    return "\n".join(
+        transpose_text(line, semitones) if is_chord_line(line) else line
+        for line in lyrics.split("\n")
+    )
+
+
+def imported_preview(data, shift=0):
+    lyrics = data["lyrics"]
+    preview = lyrics[:900] + ("\n…" if len(lyrics) > 900 else "")
+    tone = data.get("song_key") or "не визначена"
+    note = "\n🎚 Зміна акордів: <b>{:+d}</b>".format(shift) if data.get("source") == "MyChords" else ""
+    return (
+        "🔎 <b>Перевір імпорт</b>\n\n"
+        f"🌐 Джерело: <b>{escape_html(data.get('source', 'Посилання'))}</b>\n"
+        f"🎵 <b>{escape_html(data['title'])}</b>\n"
+        f"👤 {escape_html(data['artist'])}\n"
+        f"🎸 Перший акорд: <b>{escape_html(tone)}</b>{note}\n\n"
+        f"<pre>{escape_html(preview)}</pre>\n\n"
+        "Перевір акорди перед збереженням. Кнопки змінюють усі акорди на півтон."
+    )
+
+
+def imported_keyboard(data, shift=0):
+    rows = []
+    if data.get("source") == "MyChords":
+        rows.append([
+            InlineKeyboardButton(text="♭ −1", callback_data="imp_tone_down"),
+            InlineKeyboardButton(text=f"🎼 {shift:+d}", callback_data="imp_tone_reset"),
+            InlineKeyboardButton(text="♯ +1", callback_data="imp_tone_up"),
+        ])
+    rows.append([InlineKeyboardButton(text="✅ Зберегти", callback_data="save_import")])
+    rows.append([InlineKeyboardButton(text="❌ Скасувати", callback_data="cancel_add")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@dp.callback_query(F.data.in_({"imp_tone_down", "imp_tone_up", "imp_tone_reset"}))
+async def adjust_import_tone(callback: CallbackQuery):
+    state = ADD_STATE.get(callback.from_user.id)
+    if not state or state.get("step") != "confirm_import" or state["data"].get("source") != "MyChords":
+        await callback.answer("Немає активного імпорту MyChords.", show_alert=True)
+        return
+    data = state["data"]
+    shift = int(state.get("import_shift", 0))
+    if callback.data == "imp_tone_reset":
+        shift = 0
+    else:
+        shift += -1 if callback.data == "imp_tone_down" else 1
+    if not -6 <= shift <= 6:
+        await callback.answer("Доступний діапазон від −6 до +6.", show_alert=True)
+        return
+    original = state["original_import"]
+    data["lyrics"] = mychords_shift_chord_rows(original["lyrics"], shift)
+    data["song_key"] = transpose_key(original.get("song_key", ""), shift)
+    state["import_shift"] = shift
+    await callback.message.edit_text(
+        imported_preview(data, shift), parse_mode="HTML",
+        reply_markup=imported_keyboard(data, shift),
+    )
+    await callback.answer()
+
+
 @dp.callback_query(F.data == "save_import")
 async def save_import(callback: CallbackQuery):
     state = ADD_STATE.get(callback.from_user.id)
@@ -2586,40 +2612,12 @@ async def text_handler(message: Message):
 
             state["step"] = "confirm_import"
             state["data"] = imported
-
-            preview = imported["lyrics"][:900]
-            if len(imported["lyrics"]) > 900:
-                preview += "\n…"
-
-
-            keyboard = InlineKeyboardMarkup(
-                inline_keyboard=[
-                    [
-                        InlineKeyboardButton(
-                            text="✅ Зберегти",
-                            callback_data="save_import"
-                        )
-                    ],
-                    [
-                        InlineKeyboardButton(
-                            text="❌ Скасувати",
-                            callback_data="cancel_add"
-                        )
-                    ]
-                ]
-            )
-
+            if imported.get("source") == "MyChords":
+                state["original_import"] = dict(imported)
+                state["import_shift"] = 0
             await wait_msg.edit_text(
-                "🔎 <b>Перевір імпорт</b>\n\n"
-                f"🌐 Джерело: <b>{escape_html(imported.get('source', 'Посилання'))}</b>\n"
-                f"🎵 <b>{escape_html(imported['title'])}</b>\n"
-                f"👤 {escape_html(imported['artist'])}\n"
-                f"🎸 Тональність: <b>{escape_html(imported['song_key'] or 'не визначена')}</b>\n\n"
-                f"<pre>{escape_html(preview)}</pre>"
-                "\n\n"
-                "Якщо все виглядає правильно — натисни «✅ Зберегти».",
-                parse_mode="HTML",
-                reply_markup=keyboard
+                imported_preview(imported), parse_mode="HTML",
+                reply_markup=imported_keyboard(imported),
             )
             return
 

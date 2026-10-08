@@ -392,12 +392,17 @@ async def import_from_mychords(url):
 
     def flush_chords():
         if pending:
-            for i in range(0, len(pending), 6):
-                lines.append(" ".join(pending[i:i+6]))
+            for i in range(0, len(pending), 4):
+                lines.append(" ".join(pending[i:i+4]))
             pending.clear()
 
     while index < len(parts):
         part = re.sub(r"\s+", " ", parts[index]).strip()
+        # MyChords keeps punctuation and repeat labels in separate DOM nodes.
+        # These are layout marks, not song lyrics or chord symbols.
+        if re.fullmatch(r"[:|¦·.\-–—]+|[}\]]\s*[xх×]\s*\d+|[xх×]\s*\d+", part, re.I):
+            index += 1
+            continue
         low = part.lower()
         if any(x in low for x in (
             "все ще шукаєш правильні акорди", "глянь 5 інших",
@@ -410,12 +415,12 @@ async def import_from_mychords(url):
             capo = int(cm.group(1))
             index += 1
             continue
-        if re.fullmatch(r"вст\.?|вступ\.?|intro\.?", low):
+        if re.fullmatch(r"вст\.?|вступ\.?|intro\.?", low.rstrip(":")) :
             flush_chords()
             lines.append("ВСТУП")
             index += 1
             continue
-        if re.fullmatch(r"куплет|приспів|програш|брідж|міст", low):
+        if re.fullmatch(r"куплет|приспів|програш|брідж|міст", low.rstrip(":")):
             flush_chords()
             heading = part.upper()
             if index + 1 < len(parts) and re.fullmatch(r"\d{1,2}", parts[index+1].strip()):
@@ -429,7 +434,7 @@ async def import_from_mychords(url):
             index += 1
             continue
         # Ignore ornamental separators, never store them as lyrics.
-        if part in {"|", "¦", ".", "·", "—"}:
+        if part in {"|", "¦", ".", "·", "—", ":", "}x2"}:
             index += 1
             continue
         # MyChords can split the Ukrainian preposition «В»/«А» into a
@@ -446,7 +451,8 @@ async def import_from_mychords(url):
         else:
             flush_chords()
             normalized = normalize_mychords_import_text(part)
-            lines.extend(normalized.splitlines() if normalized else [part])
+            if normalized:
+                lines.extend(normalized.splitlines())
         index += 1
     flush_chords()
     lyrics = normalize_song_text("\n".join(lines))
@@ -1996,7 +2002,11 @@ def mychords_shift_chord_rows(lyrics, semitones):
 
 def imported_preview(data, shift=0):
     lyrics = data["lyrics"]
-    preview = lyrics[:900] + ("\n…" if len(lyrics) > 900 else "")
+    if len(lyrics) > 900:
+        cut = lyrics.rfind("\n", 0, 900)
+        preview = lyrics[:cut if cut > 600 else 900] + "\n…"
+    else:
+        preview = lyrics
     tone = data.get("song_key") or "не визначена"
     note = "\n🎚 Зміна акордів: <b>{:+d}</b>".format(shift) if data.get("source") == "MyChords" else ""
     return (

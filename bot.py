@@ -421,6 +421,40 @@ async def import_from_mychords(url):
                     print("MYCHORDS_TRANS_HTTP", label, "ERROR", type(exc).__name__, flush=True)
         print("MYCHORDS_TRANS_END", flush=True)
 
+    # JS-only diagnostic: inspect scripts and transpose references, no POST requests.
+    if "152138-nazarij-remchuk-gaj-zelenij-gaj" in url:
+        from urllib.parse import urljoin, urlsplit
+        print("MYCHORDS_JS_BEGIN", flush=True)
+        script_urls = []
+        for script in soup.find_all("script"):
+            src = script.get("src")
+            if src:
+                full = urljoin(url, src)
+                if urlsplit(full).netloc == urlsplit(url).netloc:
+                    script_urls.append(full)
+            else:
+                content = script.get_text() or ""
+                for m in list(re.finditer(r"(?i)(/uk/trans|/trans|b-transpose|b-accord__symbol|tone-value)", content))[:6]:
+                    print("MYCHORDS_JS_INLINE", repr(re.sub(r"\s+", " ", content[max(0,m.start()-160):m.end()+220]))[:450], flush=True)
+        print("MYCHORDS_JS_SCRIPT_COUNT", len(script_urls), flush=True)
+        for src in script_urls[-12:]:
+            print("MYCHORDS_JS_SRC", urlsplit(src).path[:180], flush=True)
+        try:
+            async with ClientSession(timeout=ClientTimeout(total=22), headers={"User-Agent": "Mozilla/5.0"}) as js_session:
+                for src in script_urls[-8:]:
+                    try:
+                        async with js_session.get(src) as resp:
+                            content = (await resp.text())[:1200000] if resp.status == 200 else ""
+                            matches = list(re.finditer(r"(?i)(/uk/trans|/trans|b-transpose|b-accord__symbol|tone-value|tone-up|tone-down)", content))
+                            print("MYCHORDS_JS_FILE", urlsplit(src).path[-100:], "STATUS", resp.status, "MATCHES", len(matches), flush=True)
+                            for m in matches[:8]:
+                                print("MYCHORDS_JS_MATCH", repr(re.sub(r"\s+", " ", content[max(0,m.start()-190):m.end()+240]))[:520], flush=True)
+                    except Exception as exc:
+                        print("MYCHORDS_JS_ERROR", type(exc).__name__, flush=True)
+        except Exception as exc:
+            print("MYCHORDS_JS_SESSION_ERROR", type(exc).__name__, flush=True)
+        print("MYCHORDS_JS_END", flush=True)
+
     parts = []
     for node in song_div.stripped_strings:
         raw = str(node).replace("\xa0", " ").replace("\u200b", "")

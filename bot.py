@@ -1749,6 +1749,10 @@ def render_song_images(song):
 
 
 def songs_view(only_favorites=False):
+    # Компактний список: звичайний перегляд одразу відкриває виконавців.
+    if not only_favorites:
+        return artists_view()
+
     if only_favorites:
         cursor.execute("""
             SELECT id, title, artist
@@ -1822,7 +1826,6 @@ def artists_view():
                 callback_data=f"artist_{representative_id}"
             )
         ])
-    keyboard.append([InlineKeyboardButton(text="⬅️ Усі пісні", callback_data="songs")])
     keyboard.append([InlineKeyboardButton(text="🏠 Головна", callback_data="home")])
     return text, InlineKeyboardMarkup(inline_keyboard=keyboard)
 
@@ -1852,6 +1855,10 @@ def artist_songs_view(representative_id):
 
 
 def search_results(query):
+    # ILIKE шукає незалежно від регістру: «скрябін» = «Скрябін».
+    query = " ".join((query or "").strip().split())
+    if not query:
+        return []
     pattern = f"%{query}%"
 
     cursor.execute("""

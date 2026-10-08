@@ -470,6 +470,35 @@ def mychords_dom_lines(song_div):
     return rows
 
 
+def mychords_restore_lyric_breaks(line):
+    """Conservative recovery of verse breaks omitted by MyChords itself.
+
+    The source sometimes combines two capitalized phrases into one lyric row.
+    Split only long Cyrillic lyric rows at an internal capitalized word, after
+    at least three words and with at least three words following it. Chords
+    remain unchanged; this is a readability heuristic, not source fidelity.
+    """
+    words = line.split()
+    if len(words) < 8 or len(line) < 55:
+        return [line]
+    candidates = []
+    for i in range(3, len(words) - 3):
+        word = words[i]
+        prev = words[i - 1]
+        if not re.match(r"^[А-ЯІЇЄҐ][а-яіїєґ']+", word):
+            continue
+        if not re.search(r"[а-яіїєґ,]$", prev, re.I):
+            continue
+        if prev.endswith(('.', '!', '?', ':', ';')):
+            continue
+        candidates.append(i)
+    if not candidates:
+        return [line]
+    # Prefer a split near the middle of a combined verse row.
+    cut = min(candidates, key=lambda i: abs(i - len(words) / 2))
+    return [' '.join(words[:cut]), ' '.join(words[cut:])]
+
+
 async def import_from_mychords(url):
     """Import the exact chord tokens in MyChords HTML, preserving line breaks."""
     html = await fetch_html(url)
@@ -519,7 +548,9 @@ async def import_from_mychords(url):
         part = re.sub(r"^,\s*", "", part)
         part = re.sub(r"\s+([,.;:!?])", r"\1", part)
         part = re.sub(r"([,;:!?])(?=[А-Яа-яІіЇїЄєҐґ])", r"\1 ", part)
-        lines.append(part)
+        # MyChords sometimes combines two lyric phrases in its own HTML.
+        # Recover only obvious long-line boundaries; never alter chords.
+        lines.extend(mychords_restore_lyric_breaks(part))
 
     lyrics = normalize_song_text("\n".join(lines))
     chords = [c for row in lyrics.splitlines() if is_chord_line(row)

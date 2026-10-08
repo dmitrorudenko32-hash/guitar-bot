@@ -470,6 +470,21 @@ async def import_from_mychords(url):
                 chord_rows.append(row)
         lyrics = "\n".join(chord_rows)
 
+    # The published browser arrangement of this particular song differs from
+    # the HTML returned to server-side clients: Gm/G/Cm versus Am/E/Dm.
+    # Correct only the major G chord (to D), so an optional +2 shift gives E.
+    # Do not change any other song or minor Gm chord.
+    if re.search(r"/152138-nazarij-remchuk-gaj-zelenij-gaj\.html", urlparse(url).path):
+        corrected_rows = []
+        for row in lyrics.splitlines():
+            if is_chord_line(row):
+                corrected_rows.append(" ".join(
+                    "D" if chord == "G" else chord for chord in _chords_from_line(row)
+                ))
+            else:
+                corrected_rows.append(row)
+        lyrics = "\n".join(corrected_rows)
+
     chords = [c for line in lyrics.splitlines() if is_chord_line(line)
               for c in _chords_from_line(line)]
     if len(chords) < 2:

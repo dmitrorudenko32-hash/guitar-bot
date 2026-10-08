@@ -380,6 +380,25 @@ async def import_from_mychords(url):
     if not song_div:
         raise ValueError("MyChords: не знайдено блок пісні.")
 
+    # Temporary safe diagnostic: only MyChords song HTML, no credentials.
+    if "152138-nazarij-remchuk-gaj-zelenij-gaj" in url:
+        print("MYCHORDS_DIAG_BEGIN", flush=True)
+        print("MYCHORDS_DIAG_HTML_SIZE", len(html), flush=True)
+        print("MYCHORDS_DIAG_H1", repr(h1.get_text(" ", strip=True)), flush=True)
+        print("MYCHORDS_DIAG_SONG_ATTRS", repr(dict(song_div.attrs))[:600], flush=True)
+        print("MYCHORDS_DIAG_CHORD_LINKS", len(song_div.select("a.b-chord")), flush=True)
+        for n, child in enumerate(song_div.descendants):
+            if n >= 170:
+                break
+            if getattr(child, "name", None):
+                attrs = {k: str(v)[:90] for k, v in child.attrs.items()
+                         if k in ("class", "data-chord", "data-original", "data-key", "style", "title")}
+                if attrs:
+                    print("MYCHORDS_DIAG_TAG", n, child.name, repr(attrs)[:350], flush=True)
+            elif isinstance(child, str) and child.strip():
+                print("MYCHORDS_DIAG_TEXT", n, repr(child.strip())[:240], flush=True)
+        print("MYCHORDS_DIAG_END", flush=True)
+
     parts = []
     for node in song_div.stripped_strings:
         raw = str(node).replace("\xa0", " ").replace("\u200b", "")

@@ -399,6 +399,38 @@ async def import_from_mychords(url):
                 print("MYCHORDS_DIAG_TEXT", n, repr(child.strip())[:240], flush=True)
         print("MYCHORDS_DIAG_END", flush=True)
 
+    # Compare server-rendered chord data across locales and cache variants.
+    # This is diagnostic only; it does not modify imported songs.
+    if "152138-nazarij-remchuk-gaj-zelenij-gaj" in url:
+        from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
+        parsed = urlsplit(url)
+        path_parts = parsed.path.split("/")
+        print("MYCHORDS_LOCALES_BEGIN", flush=True)
+        timeout = ClientTimeout(total=18)
+        async with ClientSession(timeout=timeout, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/154.0.0.0 Safari/537.36",
+            "Accept-Language": "uk-UA,uk;q=0.9,en;q=0.7",
+        }) as diagnostic_session:
+            for locale in ("uk", "en", "de", "ru"):
+                test_parts = path_parts[:]
+                if len(test_parts) > 1:
+                    test_parts[1] = locale
+                test_url = urlunsplit((parsed.scheme, parsed.netloc, "/".join(test_parts), "", ""))
+                try:
+                    async with diagnostic_session.get(test_url, allow_redirects=True) as resp:
+                        test_html = await resp.text()
+                        test_soup = BeautifulSoup(test_html, "html.parser")
+                        test_song = test_soup.select_one("div.w-words__text")
+                        symbols = ([x.get_text(" ", strip=True) for x in test_song.select(".b-accord__symbol")]
+                                   if test_song else [])
+                        print("MYCHORDS_LOCALE", locale, "STATUS", resp.status,
+                              "FINAL_PATH", urlsplit(str(resp.url)).path,
+                              "CHORDS", repr(symbols[:24]),
+                              "COUNT", len(symbols), flush=True)
+                except Exception as exc:
+                    print("MYCHORDS_LOCALE", locale, "ERROR", type(exc).__name__, flush=True)
+        print("MYCHORDS_LOCALES_END", flush=True)
+
     parts = []
     for node in song_div.stripped_strings:
         raw = str(node).replace("\xa0", " ").replace("\u200b", "")

@@ -198,6 +198,27 @@ def bottom_keyboard():
     )
 
 
+def _song_identity(value):
+    """Normalize song/artist names for case-insensitive duplicate detection."""
+    import unicodedata
+    value = unicodedata.normalize("NFKC", str(value or ""))
+    return " ".join(value.casefold().split())
+
+
+def find_existing_song(title, artist):
+    """Treat the same title by the same artist as a duplicate."""
+    target = (_song_identity(title), _song_identity(artist))
+    cursor.execute("SELECT id, title, artist FROM songs")
+    for song_id, saved_title, saved_artist in cursor.fetchall():
+        if (_song_identity(saved_title), _song_identity(saved_artist)) == target:
+            return song_id
+    return None
+
+
+def duplicate_song_message():
+    return "⚠️ <b>Ця пісня вже є у твоєму пісеннику!</b>\n\nПовторно додавати її не потрібно."
+
+
 def get_song(song_id):
     cursor.execute("""
         SELECT id, title, artist, song_key, lyrics, favorite,
@@ -2199,6 +2220,18 @@ async def save_import(callback: CallbackQuery):
 
     data = state["data"]
 
+    existing_id = find_existing_song(data["title"], data["artist"])
+    if existing_id is not None:
+        ADD_STATE.pop(callback.from_user.id, None)
+        await callback.answer("Ця пісня вже додана", show_alert=True)
+        song = get_song(existing_id)
+        card_text, card_keyboard = song_card(song)
+        await callback.message.edit_text(
+            duplicate_song_message() + "\n\n" + card_text,
+            parse_mode="HTML", reply_markup=card_keyboard
+        )
+        return
+
     cursor.execute("""
         INSERT INTO songs
         (title, artist, song_key, lyrics, source_url, capo)
@@ -2750,6 +2783,15 @@ async def text_handler(message: Message):
                 )
                 return
 
+            existing_id = find_existing_song(imported["title"], imported["artist"])
+            if existing_id is not None:
+                ADD_STATE.pop(user_id, None)
+                await wait_msg.edit_text(duplicate_song_message(), parse_mode="HTML")
+                song = get_song(existing_id)
+                card_text, card_keyboard = song_card(song)
+                await message.answer(card_text, parse_mode="HTML", reply_markup=card_keyboard)
+                return
+
             state["step"] = "confirm_import"
             state["data"] = imported
             if imported.get("source") == "MyChords":
@@ -2787,6 +2829,14 @@ async def text_handler(message: Message):
 
         if step == "artist":
             state["data"]["artist"] = text
+            existing_id = find_existing_song(state["data"]["title"], text)
+            if existing_id is not None:
+                ADD_STATE.pop(user_id, None)
+                await message.answer(duplicate_song_message(), parse_mode="HTML")
+                song = get_song(existing_id)
+                card_text, card_keyboard = song_card(song)
+                await message.answer(card_text, parse_mode="HTML", reply_markup=card_keyboard)
+                return
             state["step"] = "key"
 
             await message.answer(
@@ -2814,6 +2864,12 @@ async def text_handler(message: Message):
 
         if step == "lyrics":
             data = state["data"]
+
+            existing_id = find_existing_song(data["title"], data["artist"])
+            if existing_id is not None:
+                ADD_STATE.pop(user_id, None)
+                await message.answer(duplicate_song_message(), parse_mode="HTML")
+                return
 
             cursor.execute("""
                 INSERT INTO songs

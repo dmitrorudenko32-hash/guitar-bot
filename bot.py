@@ -368,87 +368,89 @@ async def fetch_html(url):
             return await response.text()
 
 
-def mychords_debug_snapshot(html):
-    """Return a compact snapshot of what Render actually receives from MyChords."""
-    soup = BeautifulSoup(html, "html.parser")
-    song_div = soup.find("div", class_="w-words__text")
-    target = song_div if song_div else soup
-    anchors = target.select("a.b-chord") if target else []
-    chord_samples = [a.get_text(" ", strip=True) for a in anchors[:20]]
-    text = target.get_text("\n", strip=True) if target else ""
-    text = text.replace("\r", "")
-    preview = text[:3500]
-    return (
-        f"song_div={'YES' if song_div else 'NO'}\n"
-        f"b-chord count={len(anchors)}\n"
-        f"b-chord samples={chord_samples}\n"
-        f"HTML length={len(html)}\n"
-        f"TEXT PREVIEW:\n{preview}"
-    )
-
-
 async def import_from_mychords(url):
-    """Import MyChords from the visible song text; do not depend on a.b-chord anchors."""
+    """Read the separate DOM text nodes returned to Render by MyChords."""
     html = await fetch_html(url)
     soup = BeautifulSoup(html, "html.parser")
-
     h1 = soup.find("h1")
     if not h1:
-        raise ValueError("Не вдалося знайти назву пісні на MyChords.")
+        raise ValueError("MyChords: не знайдено назву пісні.")
     artist, title = split_artist_title(h1.get_text(" ", strip=True))
-
     song_div = soup.find("div", class_="w-words__text")
     if not song_div:
-        raise ValueError("MyChords: не знайдено блок пісні w-words__text.")
+        raise ValueError("MyChords: не знайдено блок пісні.")
 
-    # MyChords may render chords as ordinary text instead of <a class=b-chord>.
-    # Preserve line breaks, then parse chord prefixes directly from the visible text.
-    for br in song_div.find_all("br"):
-        br.replace_with("\n")
+    parts = []
+    for node in song_div.stripped_strings:
+        raw = str(node).replace("\xa0", " ").replace("\u200b", "")
+        parts.extend(x.strip() for x in raw.splitlines() if x.strip())
 
-    text = song_div.get_text(" ", strip=False)
-    # get_text separator can add spaces around our explicit newlines; clean them only.
-    text = re.sub(r"[ \t]*\n[ \t]*", "\n", text)
-    lyrics = normalize_mychords_import_text(text)
+    lines = []
+    pending = []
+    capo = 0
+    index = 0
 
-    if not lyrics or len(lyrics) < 40:
-        raise ValueError("MyChords: блок пісні порожній або неповний.")
+    def flush_chords():
+        if pending:
+            for i in range(0, len(pending), 6):
+                lines.append(" ".join(pending[i:i+6]))
+            pending.clear()
 
-    # Detect chords from the normalized text itself. This works whether MyChords
-    # used chord anchors or plain text such as 'Am Dm Темна нічка...'.
-    chords = []
-    for line in lyrics.splitlines():
-        if is_chord_line(line):
-            chords.extend(_chords_from_line(line))
-
+    while index < len(parts):
+        part = re.sub(r"\s+", " ", parts[index]).strip()
+        low = part.lower()
+        if any(x in low for x in (
+            "все ще шукаєш правильні акорди", "глянь 5 інших",
+            "інші варіанти цієї пісні", "повідомити про помилку",
+            "відео від користувачів", "коментарі"
+        )):
+            break
+        cm = re.search(r"кап[оі]дастер\s+на\s+(\d+)\s+лад", low)
+        if cm:
+            capo = int(cm.group(1))
+            index += 1
+            continue
+        if re.fullmatch(r"вст\.?|вступ\.?|intro\.?", low):
+            flush_chords()
+            lines.append("ВСТУП")
+            index += 1
+            continue
+        if re.fullmatch(r"куплет|приспів|програш|брідж|міст", low):
+            flush_chords()
+            heading = part.upper()
+            if index + 1 < len(parts) and re.fullmatch(r"\d{1,2}", parts[index+1].strip()):
+                heading += " " + parts[index+1].strip()
+                index += 1
+            lines.append(heading)
+            index += 1
+            continue
+        if re.fullmatch(r"\d{1,2}", part) and lines and re.match(r"^(КУПЛЕТ|ПРИСПІВ)\b", lines[-1]):
+            lines[-1] += " " + part
+            index += 1
+            continue
+        words = part.split()
+        fixed = [normalize_mychords_chord_token(w) for w in words]
+        if fixed and all(CHORD_TOKEN_RE.fullmatch(w) for w in fixed):
+            pending.extend(fixed)
+        else:
+            flush_chords()
+            # Normalize mixed chord-prefix + lyric rows as well.
+            normalized = normalize_mychords_import_text(part)
+            lines.extend(normalized.splitlines() if normalized else [part])
+        index += 1
+    flush_chords()
+    lyrics = normalize_song_text("\n".join(lines))
+    chords = [c for line in lyrics.splitlines() if is_chord_line(line)
+              for c in _chords_from_line(line)]
     if len(chords) < 2:
-        debug = mychords_debug_snapshot(html)
-        print("\n===== MYCHORDS DEBUG =====\n" + debug + "\n===== END MYCHORDS DEBUG =====\n", flush=True)
-        raise ValueError(
-            "MyChords: у тексті пісні не знайдено достатньо акордів.\n\n"
-            "🔧 Діагностику записано в Render Logs. "
-            "Відкрий Logs і надішли мені блок між MYCHORDS DEBUG та END MYCHORDS DEBUG."
-        )
-
-    # For an H1 containing only the title, use the category/artist breadcrumb when possible.
-    if artist == "Невідомий виконавець":
-        for a_tag in soup.find_all("a", href=True):
-            href = a_tag.get("href", "")
-            label = " ".join(a_tag.get_text(" ", strip=True).split())
-            if label and "/uk/" in href and label.lower() not in {"головна", "акорди"}:
-                if "ukrayinski-narodni" in href:
-                    artist = "Українські народні"
-                    break
-
+        raise ValueError("MyChords: у тексті не вдалося знайти акорди.")
+    if artist == "Невідомий виконавець" and "ukrayinski-narodni" in url:
+        artist = "Українські народні"
     return {
-        "title": title,
-        "artist": artist,
-        "song_key": chords[0],
-        "lyrics": lyrics,
-        "source_url": url.strip(),
-        "source": "MyChords",
+        "title": title, "artist": artist, "song_key": chords[0],
+        "lyrics": lyrics, "capo": capo,
+        "source_url": url.strip(), "source": "MyChords",
     }
-
 
 def normalize_diez_chord_rows(text):
     """Group consecutive Diez chord-only lines into compact rows (max 4 chords)."""
@@ -1996,15 +1998,16 @@ async def save_import(callback: CallbackQuery):
 
     cursor.execute("""
         INSERT INTO songs
-        (title, artist, song_key, lyrics, source_url)
-        VALUES (%s, %s, %s, %s, %s)
+        (title, artist, song_key, lyrics, source_url, capo)
+        VALUES (%s, %s, %s, %s, %s, %s)
         RETURNING id
     """, (
         data["title"],
         data["artist"],
         data.get("song_key", ""),
         data["lyrics"],
-        data.get("source_url", "")
+        data.get("source_url", ""),
+        data.get("capo", 0)
     ))
 
     song_id = cursor.fetchone()[0]

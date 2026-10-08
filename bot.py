@@ -2163,36 +2163,44 @@ async def receive_ocr_image(message: Message):
     state = ADD_STATE.get(message.from_user.id)
     if not state or state.get("step") != "ocr_images":
         return
+    if not message.photo and not (message.document and
+            ((message.document.mime_type or "").startswith("image/") or
+             (message.document.file_name or "").lower().endswith((".png", ".jpg", ".jpeg", ".webp")))):
+        await message.answer("Надішли зображення JPG, PNG або WEBP.")
+        return
     parts = state["ocr_parts"]
     if len(parts) >= 8:
-        await message.answer("⚠️ Максимум 8 скриншотів. Натисни «Усі скрини надіслано».", reply_markup=screenshot_keyboard())
+        await message.answer("⚠️ Максимум 8 скриншотів.", reply_markup=screenshot_keyboard())
         return
+
+    # Reserve the slot BEFORE downloading/OCR: otherwise a fast tap on Done
+    # races the OCR task and incorrectly reports that zero images were sent.
+    slot = len(parts)
+    parts.append(None)
+    await message.answer(f"📸 Отримано скриншот {slot + 1}/8. Розпізнаю текст…",
+                         reply_markup=screenshot_keyboard())
     try:
-        if message.photo:
-            file_id = message.photo[-1].file_id
-        elif message.document and (message.document.mime_type or "").startswith("image/"):
-            file_id = message.document.file_id
-        else:
-            await message.answer("Надішли зображення JPG або PNG.")
-            return
+        file_id = message.photo[-1].file_id if message.photo else message.document.file_id
         file = await bot.get_file(file_id)
         buffer = io.BytesIO()
         await bot.download_file(file.file_path, destination=buffer)
         raw = await asyncio.to_thread(ocr_screenshot, buffer.getvalue())
         raw = raw.replace("\r", "").strip()
         if len(raw) < 12:
-            await message.answer("⚠️ Майже нічого не розпізнав. Спробуй чіткіший скриншот.")
+            parts[slot] = ""
+            await message.answer("⚠️ Скриншот отримано, але текст майже не розпізнано. "
+                                 "Надішли чіткіше зображення.", reply_markup=screenshot_keyboard())
             return
-        parts.append(raw)
-        await message.answer(
-            f"✅ Скриншот {len(parts)}/8 розпізнано. Надішли наступний або заверши.",
-            reply_markup=screenshot_keyboard())
-    except Exception as exc:
+        parts[slot] = raw
+        await message.answer(f"✅ Скриншот {slot + 1}/8 розпізнано!",
+                             reply_markup=screenshot_keyboard())
+    except Exception:
         import logging
         logging.exception("OCR failed")
-        await message.answer("❌ Не вдалося розпізнати зображення. "
-                             "Перевір, чи встановлено Tesseract з мовами ukr та eng. "
-                             f"Деталі: {escape_html(str(exc))[:250]}", parse_mode="HTML")
+        parts[slot] = ""
+        await message.answer("❌ Фото отримано, але OCR не спрацював. "
+                             "Перевір Tesseract та мови ukr+eng у Render (Logs).",
+                             reply_markup=screenshot_keyboard())
 
 
 @dp.callback_query(F.data == "ocr_done")
@@ -2201,10 +2209,14 @@ async def ocr_done(callback: CallbackQuery):
     if not state or state.get("step") != "ocr_images":
         await callback.answer("Немає активного імпорту", show_alert=True)
         return
-    if not state["ocr_parts"]:
-        await callback.answer("Спочатку надішли хоча б один скриншот", show_alert=True)
+    if any(part is None for part in state["ocr_parts"]):
+        await callback.answer("⏳ Зачекай, ще розпізнаю скриншоти", show_alert=True)
         return
-    state["data"]["lyrics"] = "\n\n".join(state["ocr_parts"])
+    recognized = [part for part in state["ocr_parts"] if part]
+    if not recognized:
+        await callback.answer("Немає розпізнаного тексту. Надішли чіткіший скриншот", show_alert=True)
+        return
+    state["data"]["lyrics"] = "\n\n".join(recognized)
     state["step"] = "ocr_title"
     await edit_screen(callback, "🎵 <b>Як називається пісня?</b>\n\nНапиши назву повідомленням.")
 

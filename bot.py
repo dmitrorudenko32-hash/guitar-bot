@@ -957,6 +957,72 @@ def repair_glued_leading_chords(text):
     return "\n".join(fixed)
 
 
+def align_chords_for_telegram(rows, max_columns=42):
+    """Rebuild compact chord-above-lyric pairs when OCR stored chords on separate rows.
+
+    Original x coordinates cannot be recovered from already-normalized text;
+    preserve existing multi-space layouts when present, otherwise spread
+    chords across the lyric line instead of stacking them at the left edge.
+    """
+    out = []
+    i = 0
+    while i < len(rows):
+        raw = rows[i]
+        if not raw.strip() or not is_chord_line(raw.strip()):
+            out.append(raw)
+            i += 1
+            continue
+        chord_rows = []
+        while i < len(rows) and rows[i].strip() and is_chord_line(rows[i].strip()):
+            chord_rows.append(rows[i])
+            i += 1
+        if i >= len(rows) or not rows[i].strip():
+            out.extend(chord_rows)
+            continue
+        lyric = rows[i].strip()
+        # Existing exact column data has priority over estimated placement.
+        if len(chord_rows) == 1 and re.search(r" {3,}", chord_rows[0]):
+            out.append(chord_rows[0].rstrip())
+            out.append(lyric)
+            i += 1
+            continue
+        chords = [ch for row in chord_rows for ch in row.split()]
+        if not chords or len(chords) > 9:
+            out.extend(chord_rows)
+            continue
+        # Telegram's monospace block is narrow on mobile. Keep rows short.
+        if len(lyric) > max_columns:
+            words = lyric.split()
+            pieces, current = [], ''
+            for word in words:
+                if current and len(current) + 1 + len(word) > max_columns:
+                    pieces.append(current)
+                    current = word
+                else:
+                    current = (current + ' ' + word).strip()
+            if current:
+                pieces.append(current)
+        else:
+            pieces = [lyric]
+        # Split chord sequence proportionally if the lyric needs multiple rows.
+        for part_index, part in enumerate(pieces):
+            a = round(part_index * len(chords) / len(pieces))
+            b = round((part_index + 1) * len(chords) / len(pieces))
+            subset = chords[a:b]
+            if subset:
+                # Position chord starts over approximately evenly spaced words.
+                width = max(len(part), len(' '.join(subset)))
+                starts = [0] if len(subset) == 1 else [round(k * max(0, width - len(subset[-1])) / (len(subset)-1)) for k in range(len(subset))]
+                buf = ''
+                for chord, pos in zip(subset, starts):
+                    pos = max(pos, len(buf) + (1 if buf else 0))
+                    buf += ' ' * (pos - len(buf)) + chord
+                out.append(buf.rstrip())
+            out.append(part)
+        i += 1
+    return out
+
+
 def pretty_song_lyrics(lyrics, semitones=0, max_body=3250):
     """One monospaced block per section; never split chord/lyric pairs."""
     source = repair_glued_leading_chords(lyrics or "")
@@ -995,6 +1061,7 @@ def pretty_song_lyrics(lyrics, semitones=0, max_body=3250):
             rows.pop()
         if not rows:
             continue
+        rows = align_chords_for_telegram(rows)
         label = f"<b>{escape_html(heading)}</b>\n" if heading else ""
         # Keep one pre for the entire section, not one per chord line.
         opening, closing = "<pre>", "</pre>"

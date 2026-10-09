@@ -2621,49 +2621,44 @@ def _scroll_pair_lines(chords, lyric):
 
 
 def _autoscroll_rows(lyrics, semitones=0):
-    """Build visual rows so chords stay above the lyric they belong to."""
-    text = repair_glued_leading_chords(lyrics)
+    """Use the exact same chord alignment as the normal song card."""
+    text = repair_glued_leading_chords(lyrics or "")
     text = transpose_text(text, semitones) if semitones else text
-    src = text.splitlines()
+    source = text.splitlines()
     rows = []
-    i = 0
+    pending = []
 
-    while i < len(src):
-        line = src[i].strip()
-        if not line:
-            rows.append(("blank", ""))
+    def flush_pending():
+        if not pending:
+            return
+        # Identical formatter to pretty_song_lyrics(): keep original spacing
+        # and distribute chord-only rows over their corresponding lyrics.
+        aligned = align_chords_for_telegram(pending[:])
+        pending.clear()
+        i = 0
+        while i < len(aligned):
+            line = aligned[i]
+            if not line.strip():
+                rows.append(("blank", ""))
+            elif is_chord_line(line.strip()) and i + 1 < len(aligned) and aligned[i + 1].strip() and not is_chord_line(aligned[i + 1].strip()):
+                rows.append(("pair", line, aligned[i + 1]))
+                i += 1
+            else:
+                rows.append(("text", line))
             i += 1
-            continue
 
-        sm = SECTION_RE.match(line)
-        if sm:
-            rows.append(("section", sm.group(1).upper()))
-            i += 1
-            continue
+    for raw in source:
+        match = SECTION_RE.match(raw.strip()) if raw.strip() else None
+        if match:
+            flush_pending()
+            rows.append(("section", match.group(1).upper()))
+        else:
+            pending.append(raw.rstrip())
+    flush_pending()
 
-        # A chord-only line followed by lyrics becomes a two-line visual pair.
-        if is_chord_line(line):
-            j = i + 1
-            while j < len(src) and not src[j].strip():
-                j += 1
-            if j < len(src):
-                nxt = src[j].strip()
-                if nxt and not SECTION_RE.match(nxt) and not is_chord_line(nxt):
-                    chord_row, lyric_row = _scroll_pair_lines(_chords_from_line(line), nxt)
-                    rows.append(("pair", chord_row, lyric_row))
-                    i = j + 1
-                    continue
-            rows.append(("chords", line))
-            i += 1
-            continue
-
-        rows.append(("text", line))
-        i += 1
-
-    # Remove repeated blank rows for a cleaner phone view.
     cleaned = []
     for row in rows:
-        if row[0] == "blank" and (not cleaned or cleaned[-1][0] == "blank"):
+        if row[0] == "blank" and (not cleaned or cleaned[-1][0] in ("blank", "section")):
             continue
         cleaned.append(row)
     return cleaned

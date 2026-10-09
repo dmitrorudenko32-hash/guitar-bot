@@ -958,60 +958,43 @@ def repair_glued_leading_chords(text):
 
 
 def pretty_song_lyrics(lyrics, semitones=0):
-    """Telegram-friendly view: section headers + bold monospace chords."""
+    """Compact Telegram song layout; preserve chord spacing above lyrics."""
     source = repair_glued_leading_chords(lyrics)
     source = transpose_text(source, semitones) if semitones else source
+    icons = {"вступ": "🎼", "куплет": "🎤", "приспів": "🔥",
+             "брідж": "🌉", "міст": "🌉", "програш": "🎸",
+             "передприспів": "✨", "постприспів": "✨", "кода": "🏁"}
+    lines = source.splitlines()
     out = []
-
-    icons = {
-        "вступ": "🎼",
-        "куплет": "🎤",
-        "приспів": "🔥",
-        "брідж": "🌉",
-        "міст": "🌉",
-        "кода": "🏁",
-        "програш": "🎸",
-        "передприспів": "✨",
-        "постприспів": "✨",
-    }
-
-    for raw in source.splitlines():
+    i = 0
+    while i < len(lines):
+        raw = lines[i]
         line = raw.strip()
-
         if not line:
-            out.append("")
+            if out and out[-1] != "":
+                out.append("")
+            i += 1
             continue
-
-        sm = SECTION_RE.match(line)
-        if sm:
-            section = sm.group(1)
-            key = re.match(r"[А-Яа-яІіЇїЄєҐґ]+", section)
-            key = key.group(0).lower() if key else ""
-            icon = icons.get(key, "🎵")
-            out.append("")
-            out.append(
-                f"<b>━━ {icon} {escape_html(section.upper())} ━━</b>"
-            )
+        section = SECTION_RE.match(line)
+        if section:
+            key_match = re.match(r"[А-Яа-яІіЇїЄєҐґ]+", section.group(1))
+            key = key_match.group(0).lower() if key_match else ""
+            out.append(f"<b>{icons.get(key, '🎵')} {escape_html(section.group(1).upper())}</b>")
+            i += 1
             continue
-
         if is_chord_line(line):
-            # Telegram doesn't support arbitrary font colors.
-            # Bold + monospace makes chords visually distinct.
-            out.append(f"<b><code>{escape_html(line)}</code></b>")
+            # One pre block for chord+lyric keeps their columns aligned.
+            chord_row = raw.rstrip()
+            if i + 1 < len(lines) and lines[i+1].strip() and not is_chord_line(lines[i+1]) and not SECTION_RE.match(lines[i+1].strip()):
+                lyric_row = lines[i+1].rstrip()
+                out.append("<pre>" + escape_html(chord_row + "\n" + lyric_row) + "</pre>")
+                i += 2
+                continue
+            out.append("<pre>" + escape_html(chord_row) + "</pre>")
         else:
             out.append(escape_html(line))
-
-    # Avoid excessive empty lines.
-    cleaned = []
-    last_blank = False
-    for x in out:
-        blank = (x == "")
-        if blank and last_blank:
-            continue
-        cleaned.append(x)
-        last_blank = blank
-
-    return "\n".join(cleaned).strip()
+        i += 1
+    return "\n".join(out).strip()
 
 
 def trim_html_message(text, limit=3300):
@@ -1041,17 +1024,22 @@ def song_card(song, semitones=None):
     transpose_label = "Оригінал" if semitones == 0 else f"{semitones:+d}"
 
     header = (
-        f"🎵 <b>{escape_html(title)}</b>\n"
-        f"👤 {escape_html(artist)}\n"
-        f"🎸 Тональність: <b>{escape_html(shown_key)}</b>\n"
-        f"🎼 Транспонування: <b>{transpose_label}</b>\n"
-        f"📎 Капо: <b>{capo}</b>\n"
+        f"🎵 <b>{escape_html(title)}</b> — {escape_html(artist)}\n"
+        f"🎸 <b>{escape_html(shown_key)}</b>  ·  Капо {capo}  ·  {transpose_label}\n"
         f"{star} {'Улюблена' if favorite else 'Не в улюблених'}"
     )
 
     # shown_lyrics already contains safe Telegram HTML.
     # Не загортаємо всю пісню в <pre>, інакше <b>/<code> не працюватимуть.
-    body = trim_html_message(shown_lyrics, 3300)
+    body = shown_lyrics
+    if len(body) > 3300:
+        parts = body.split("\n")
+        kept = []
+        for part in parts:
+            if len("\n".join(kept + [part])) > 3250:
+                break
+            kept.append(part)
+        body = "\n".join(kept) + "\n<i>…пісня довша, показано частину</i>"
     text = header + "\n\n" + body
 
     keyboard_rows = [
@@ -1278,13 +1266,16 @@ def normalize_song_text(text):
             out.append(line)
             continue
 
-        # Standardize chord-only rows without changing the chords themselves.
+        # Standardize chord-only rows without changing their horizontal positions.
+        original_chord_spacing = raw.rstrip(" \t")
         tokens = [t for t in re.split(r"\s+", line) if t]
         if tokens:
             cleaned = [t.strip("|[](){}.,:;") for t in tokens]
             chord_count = sum(bool(CHORD_TOKEN_RE.fullmatch(t)) for t in cleaned)
             if chord_count == len(cleaned):
-                line = " ".join(cleaned)
+                # Keep spacing when OCR provided columns, instead of collapsing
+                # multiple chords into a left-aligned list.
+                line = original_chord_spacing if len(tokens) > 1 or original_chord_spacing.startswith(" ") else " ".join(cleaned)
 
         out.append(line)
 

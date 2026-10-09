@@ -2678,24 +2678,28 @@ def autoscroll_text(song, offset, speed, window=7):
 
     offset = max(0, min(offset, max(0, len(rows) - 1)))
     shown = rows[offset:offset + window]
+    # One monospaced block for the entire visible passage, just like
+    # pretty_song_lyrics(). Do not make a separate <pre> for every chord.
     body = []
+    block = []
+
+    def flush_block():
+        if block:
+            body.append("<pre>" + escape_html("\n".join(block).strip("\n")) + "</pre>")
+            block.clear()
 
     for row in shown:
         kind = row[0]
-        if kind == "blank":
-            body.append("")
-        elif kind == "section":
+        if kind == "section":
+            flush_block()
             body.append(f"<b>━━ {escape_html(row[1])} ━━</b>")
         elif kind == "pair":
-            # One PRE block is important: Telegram preserves every space,
-            # therefore each chord remains above the intended word.
-            body.append(
-                "<pre>" + escape_html(row[1]) + "\n" + escape_html(row[2]) + "</pre>"
-            )
-        elif kind == "chords":
-            body.append("<pre>" + escape_html(row[1]) + "</pre>")
+            block.extend((row[1], row[2]))
+        elif kind == "blank":
+            block.append("")
         else:
-            body.append(escape_html(row[1]))
+            block.append(row[1])
+    flush_block()
 
     progress = min(100, int((offset + 1) * 100 / max(1, len(rows))))
     return (

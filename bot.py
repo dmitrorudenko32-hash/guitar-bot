@@ -957,44 +957,72 @@ def repair_glued_leading_chords(text):
     return "\n".join(fixed)
 
 
-def pretty_song_lyrics(lyrics, semitones=0):
-    """Compact Telegram song layout; preserve chord spacing above lyrics."""
-    source = repair_glued_leading_chords(lyrics)
+def pretty_song_lyrics(lyrics, semitones=0, max_body=3250):
+    """One monospaced block per section; never split chord/lyric pairs."""
+    source = repair_glued_leading_chords(lyrics or "")
     source = transpose_text(source, semitones) if semitones else source
     icons = {"вступ": "🎼", "куплет": "🎤", "приспів": "🔥",
              "брідж": "🌉", "міст": "🌉", "програш": "🎸",
              "передприспів": "✨", "постприспів": "✨", "кода": "🏁"}
-    lines = source.splitlines()
-    out = []
-    i = 0
-    while i < len(lines):
-        raw = lines[i]
+    sections = []
+    heading = None
+    rows = []
+    for raw in source.splitlines():
         line = raw.strip()
-        if not line:
-            if out and out[-1] != "":
-                out.append("")
-            i += 1
-            continue
-        section = SECTION_RE.match(line)
+        section = SECTION_RE.match(line) if line else None
         if section:
-            key_match = re.match(r"[А-Яа-яІіЇїЄєҐґ]+", section.group(1))
-            key = key_match.group(0).lower() if key_match else ""
-            out.append(f"<b>{icons.get(key, '🎵')} {escape_html(section.group(1).upper())}</b>")
-            i += 1
-            continue
-        if is_chord_line(line):
-            # One pre block for chord+lyric keeps their columns aligned.
-            chord_row = raw.rstrip()
-            if i + 1 < len(lines) and lines[i+1].strip() and not is_chord_line(lines[i+1]) and not SECTION_RE.match(lines[i+1].strip()):
-                lyric_row = lines[i+1].rstrip()
-                out.append("<pre>" + escape_html(chord_row + "\n" + lyric_row) + "</pre>")
-                i += 2
-                continue
-            out.append("<pre>" + escape_html(chord_row) + "</pre>")
+            if rows or heading is not None:
+                sections.append((heading, rows))
+            label = section.group(1)
+            match = re.match(r"[А-Яа-яІіЇїЄєҐґ]+", label)
+            key = match.group(0).lower() if match else ""
+            heading = f"{icons.get(key, '🎵')} {label.upper()}"
+            rows = []
         else:
-            out.append(escape_html(line))
-        i += 1
-    return "\n".join(out).strip()
+            # Keep the original spaces, essential for chord alignment.
+            rows.append(raw.rstrip())
+    if rows or heading is not None:
+        sections.append((heading, rows))
+
+    result = []
+    used = 0
+    truncated = False
+    for heading, rows in sections:
+        # Only trim on complete lines, before adding HTML tags.
+        while rows and not rows[0].strip():
+            rows.pop(0)
+        while rows and not rows[-1].strip():
+            rows.pop()
+        if not rows:
+            continue
+        label = f"<b>{escape_html(heading)}</b>\n" if heading else ""
+        # Keep one pre for the entire section, not one per chord line.
+        opening, closing = "<pre>", "</pre>"
+        available = max_body - used - len(label) - len(opening) - len(closing) - 3
+        if available <= 0:
+            truncated = True
+            break
+        selected = []
+        count = 0
+        for row in rows:
+            encoded = escape_html(row)
+            extra = len(encoded) + (1 if selected else 0)
+            if count + extra > available:
+                truncated = True
+                break
+            selected.append(encoded)
+            count += extra
+        if not selected:
+            truncated = True
+            break
+        part = label + opening + "\n".join(selected) + closing
+        result.append(part)
+        used += len(part) + 2
+        if len(selected) < len(rows):
+            break
+    if truncated:
+        result.append("<i>…пісня довша, показано частину</i>")
+    return "\n\n".join(result)
 
 
 def trim_html_message(text, limit=3300):
@@ -1032,14 +1060,6 @@ def song_card(song, semitones=None):
     # shown_lyrics already contains safe Telegram HTML.
     # Не загортаємо всю пісню в <pre>, інакше <b>/<code> не працюватимуть.
     body = shown_lyrics
-    if len(body) > 3300:
-        parts = body.split("\n")
-        kept = []
-        for part in parts:
-            if len("\n".join(kept + [part])) > 3250:
-                break
-            kept.append(part)
-        body = "\n".join(kept) + "\n<i>…пісня довша, показано частину</i>"
     text = header + "\n\n" + body
 
     keyboard_rows = [
